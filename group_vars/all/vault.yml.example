@@ -1,0 +1,6 @@
+---
+# cp vault.yml.example vault.yml && ansible-vault encrypt vault.yml
+proxmox_api_token_secret: "00000000-0000-0000-0000-000000000000"
+# Optional: basic-auth password Ironic uses for the Proxmox Redfish BMC
+# (autoscale.yml). Without it one is generated in the state dir.
+redfish_bmc_password: "change-me"

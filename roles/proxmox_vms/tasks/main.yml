@@ -1,0 +1,49 @@
+---
+# Boot order disk first, then CD: the empty disk falls through to the agent
+# ISO on first boot; once RHCOS is written to disk the VM boots from disk on
+# every later reboot, so the ISO never has to be ejected mid-install.
+# cpu: host is required - RHCOS 10 needs x86-64-v3 (AVX2), which the default
+# kvm64/x86-64-v2-AES CPU types do not expose.
+
+- name: Create OpenShift VMs
+  community.proxmox.proxmox_kvm:
+    node: "{{ item.pve_node }}"
+    vmid: "{{ item.vmid }}"
+    name: "{{ item.name }}.{{ cluster_name }}"
+    tags: ["openshift", "{{ cluster_name }}", "{{ item.role }}"]
+    ostype: l26
+    bios: ovmf
+    machine: q35
+    efidisk0:
+      storage: "{{ proxmox_disk_storage }}"
+      format: raw
+      efitype: 4m
+      pre_enrolled_keys: false
+    cpu: host
+    sockets: 1
+    cores: "{{ item.cores }}"
+    memory: "{{ item.memory }}"
+    balloon: 0
+    numa_enabled: true
+    scsihw: virtio-scsi-single
+    scsi:
+      scsi0: "{{ proxmox_disk_storage }}:{{ item.disk_gb }},iothread=1,ssd=1,discard=on"
+    ide:
+      ide2: "{{ proxmox_iso_storage }}:iso/{{ agent_iso_name }},media=cdrom"
+    net:
+      net0: "virtio={{ item.mac }},bridge={{ proxmox_bridge }}{{ (',tag=' ~ proxmox_vlan) if proxmox_vlan | string | length > 0 else '' }}"
+    boot: "order=scsi0;ide2"
+    onboot: true
+    state: present
+  loop: "{{ ocp_nodes }}"
+  loop_control:
+    label: "{{ item.name }} ({{ item.vmid }} on {{ item.pve_node }})"
+
+- name: Start masters first (rendezvous host = {{ rendezvous_ip }})
+  community.proxmox.proxmox_kvm:
+    node: "{{ item.pve_node }}"
+    vmid: "{{ item.vmid }}"
+    state: started
+  loop: "{{ ocp_masters + ocp_workers }}"
+  loop_control:
+    label: "{{ item.name }}"

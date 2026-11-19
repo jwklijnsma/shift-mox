@@ -1,0 +1,135 @@
+name: Deploy OpenShift on Proxmox
+
+# Manual only: a cluster install is long, stateful and costs real resources,
+# so it never starts from a push. Run it from the Actions tab.
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "What to do"
+        type: choice
+        options: [deploy, destroy]
+        default: deploy
+      stage:
+        description: "Deploy stage (all = full run; wait = re-attach; autoscale = worker autoscaling after install)"
+        type: choice
+        options: [all, iso, vms, wait, autoscale]
+        default: all
+      rebuild_iso:
+        description: "Force a fresh agent ISO (after changing cluster.yml)"
+        type: boolean
+        default: false
+      confirm:
+        description: "For destroy: type the cluster name"
+        type: string
+        default: ""
+
+# One run at a time per repo - two installers on the same state dir would collide.
+concurrency:
+  group: openshift-proxmox
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    name: ${{ inputs.action }} (${{ inputs.stage }})
+    runs-on: [self-hosted, linux, proxmox]
+    # Secrets live in the "proxmox" environment; add required reviewers there
+    # if you want an approval click before every deploy/destroy.
+    environment: proxmox
+    timeout-minutes: 240
+    env:
+      OCP_STATE_DIR: /var/lib/ocp-deploy
+      ANSIBLE_FORCE_COLOR: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Ansible (venv kept on the runner)
+        run: |
+          python3 -m venv "$HOME/.venv-ansible"
+          "$HOME/.venv-ansible/bin/pip" install -q --upgrade pip ansible-core proxmoxer requests requests-toolbelt
+          echo "$HOME/.venv-ansible/bin" >> "$GITHUB_PATH"
+
+      - name: Install collections
+        run: ansible-galaxy collection install -r requirements.yml -p ./collections
+
+      - name: Write secrets to a private temp dir
+        env:
+          PROXMOX_API_TOKEN_SECRET: ${{ secrets.PROXMOX_API_TOKEN_SECRET }}
+          OCP_PULL_SECRET: ${{ secrets.OCP_PULL_SECRET }}
+          OCP_SSH_PUBKEY: ${{ secrets.OCP_SSH_PUBKEY }}
+          ANSIBLE_VAULT_PASSWORD: ${{ secrets.ANSIBLE_VAULT_PASSWORD }}
+          REDFISH_BMC_PASSWORD: ${{ secrets.REDFISH_BMC_PASSWORD }}
+          # Optional repo variable: API address as seen from the runner LXC
+          PROXMOX_API_HOST: ${{ vars.PROXMOX_API_HOST }}
+        run: |
+          set -euo pipefail
+          umask 077
+          d="$RUNNER_TEMP/ocp-secrets"; mkdir -p "$d"
+          for v in PROXMOX_API_TOKEN_SECRET OCP_SSH_PUBKEY; do
+            [ -n "${!v}" ] || { echo "::error::Secret $v is not set in the 'proxmox' environment"; exit 1; }
+          done
+          # Pull secret: required for OpenShift, not used for OKD
+          if grep -qE '^ocp_distribution:[[:space:]]*"?okd' group_vars/all/cluster.yml; then
+            echo "OKD: no pull secret needed"
+          else
+            [ -n "$OCP_PULL_SECRET" ] || { echo "::error::Secret OCP_PULL_SECRET is not set (needed for OpenShift; not for OKD)"; exit 1; }
+            printf '%s' "$OCP_PULL_SECRET" > "$d/pull-secret.json"
+            python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$d/pull-secret.json" \
+              || { echo "::error::OCP_PULL_SECRET is not valid JSON"; exit 1; }
+          fi
+          printf '%s\n' "$OCP_SSH_PUBKEY" > "$d/id.pub"
+          python3 - "$d" <<'EOF'
+          import json, os, sys
+          d = sys.argv[1]
+          v = {
+              "proxmox_api_token_secret": os.environ["PROXMOX_API_TOKEN_SECRET"],
+              "pull_secret_file": f"{d}/pull-secret.json",
+              "ssh_pubkey_file": f"{d}/id.pub",
+              "ocp_state_dir": os.environ["OCP_STATE_DIR"],
+          }
+          if os.environ.get("REDFISH_BMC_PASSWORD"):
+              v["redfish_bmc_password"] = os.environ["REDFISH_BMC_PASSWORD"]
+          if os.environ.get("PROXMOX_API_HOST"):
+              v["proxmox_api_host"] = os.environ["PROXMOX_API_HOST"]
+          json.dump(v, open(f"{d}/ci-vars.json", "w"))
+          EOF
+          # Only needed if you committed an encrypted group_vars/all/vault.yml
+          if [ -n "$ANSIBLE_VAULT_PASSWORD" ]; then
+            printf '%s' "$ANSIBLE_VAULT_PASSWORD" > "$d/vault-pass"
+            echo "ANSIBLE_VAULT_PASSWORD_FILE=$d/vault-pass" >> "$GITHUB_ENV"
+          fi
+          echo "CI_VARS=$d/ci-vars.json" >> "$GITHUB_ENV"
+
+      - name: Deploy
+        if: inputs.action == 'deploy'
+        env:
+          REDFISH_BMC_PASSWORD: ${{ secrets.REDFISH_BMC_PASSWORD }}
+          STAGE: ${{ inputs.stage }}
+          REBUILD: ${{ inputs.rebuild_iso }}
+        run: |
+          set -euo pipefail
+          if [ "$STAGE" = "autoscale" ]; then
+            # The runner user can't install system services, so the Redfish
+            # emulator (tag bmc) is installed once from your machine:
+            #   ansible-playbook autoscale.yml --tags bmc
+            # with the same redfish_bmc_password as the REDFISH_BMC_PASSWORD secret.
+            [ -n "${REDFISH_BMC_PASSWORD:-}" ] || { echo "::error::Secret REDFISH_BMC_PASSWORD is not set (must match the emulator's password)"; exit 1; }
+            exec ansible-playbook autoscale.yml -e "@$CI_VARS" --skip-tags bmc
+          fi
+          tags=()
+          [ "$STAGE" != "all" ] && tags=(--tags "$STAGE")
+          ansible-playbook site.yml -e "@$CI_VARS" -e "agent_iso_rebuild=$REBUILD" "${tags[@]}"
+
+      - name: Destroy
+        if: inputs.action == 'destroy'
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+        run: ansible-playbook destroy.yml -e "@$CI_VARS" -e "confirm_destroy=$CONFIRM"
+
+      - name: Remove secrets
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/ocp-secrets"

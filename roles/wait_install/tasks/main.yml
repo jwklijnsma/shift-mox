@@ -1,0 +1,30 @@
+---
+- name: Wait for bootstrap-complete (up to ~70 min)
+  ansible.builtin.command:
+    cmd: "{{ ocp_install_bin }} agent wait-for bootstrap-complete --dir {{ work_dir }}/build --log-level info"
+  async: 4500
+  poll: 30
+  changed_when: false
+
+- name: Wait for install-complete (up to ~90 min)
+  ansible.builtin.command:
+    cmd: "{{ ocp_install_bin }} agent wait-for install-complete --dir {{ work_dir }}/build --log-level info"
+  async: 5400
+  poll: 30
+  changed_when: false
+
+- name: Check cluster version
+  ansible.builtin.command:
+    cmd: "{{ oc_bin }} get clusterversion -o jsonpath={.items[0].status.desired.version}"
+  environment:
+    KUBECONFIG: "{{ work_dir }}/kubeconfig"
+  register: wait_install_cv
+  changed_when: false
+
+- name: Done
+  ansible.builtin.debug:
+    msg:
+      - "{{ 'OKD' if ocp_is_okd else 'OpenShift' }} {{ wait_install_cv.stdout }} is up."
+      - "Console:    https://console-openshift-console.apps.{{ cluster_name }}.{{ base_domain }}"
+      - "KUBECONFIG: {{ work_dir }}/kubeconfig"
+      - "kubeadmin:  {{ work_dir }}/kubeadmin-password"

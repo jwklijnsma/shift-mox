@@ -1,0 +1,10 @@
+---
+- name: Upload agent ISO to Proxmox storage
+  community.proxmox.proxmox_template:
+    node: "{{ proxmox_iso_node }}"
+    storage: "{{ proxmox_iso_storage }}"
+    content_type: iso
+    src: "{{ work_dir }}/{{ agent_iso_name }}"
+    timeout: 900
+    force: "{{ agent_iso_rebuild | default(false) | bool }}"
+    state: present

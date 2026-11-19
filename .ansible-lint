@@ -1,0 +1,8 @@
+---
+# The docs (Zensical) are not Ansible content.
+exclude_paths:
+  - docs/
+  - site/
+  - collections/
+  - .work/
+  - .cache/

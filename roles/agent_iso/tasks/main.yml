@@ -1,0 +1,106 @@
+---
+# openshift-install consumes (deletes) the config files when it builds the
+# image, so they are rendered into a fresh build dir every time. The rendered
+# copies in work_dir/config/ are kept for review / git diffs.
+
+- name: Check the distribution setting
+  ansible.builtin.assert:
+    that: ocp_distribution | default('ocp') in ['ocp', 'okd']
+    fail_msg: "ocp_distribution must be 'ocp' (OpenShift) or 'okd', not '{{ ocp_distribution }}'."
+    quiet: true
+
+- name: OpenShift needs a Red Hat pull secret (OKD does not)
+  when: not ocp_is_okd
+  block:
+    - name: Look for the pull secret file
+      ansible.builtin.stat:
+        path: "{{ pull_secret_file }}"
+      register: agent_iso_pull_secret
+
+    - name: Fail without a pull secret
+      ansible.builtin.assert:
+        that: agent_iso_pull_secret.stat.exists and agent_iso_pull_secret.stat.size > 0
+        fail_msg: >-
+          No pull secret at {{ pull_secret_file }}. Get it from
+          https://console.redhat.com/openshift/install/pull-secret - or set
+          ocp_distribution: okd to install OKD, which needs none.
+        quiet: true
+
+- name: Check the CNI settings
+  ansible.builtin.assert:
+    that:
+      - cni in ['Calico', 'OVNKubernetes']
+      - calico_dataplane in ['Iptables', 'BPF']
+      - calico_encapsulation in ['VXLAN', 'IPIP', 'None']
+    fail_msg: >-
+      cni must be Calico or OVNKubernetes, calico_dataplane Iptables or BPF,
+      calico_encapsulation VXLAN, IPIP or None.
+    quiet: true
+
+- name: Sanity checks on the node list
+  ansible.builtin.assert:
+    that:
+      - (ocp_masters | length) in [1, 3]
+      - not ((ocp_masters | length) == 1 and (ocp_workers | length) > 0)
+      - (ocp_nodes | map(attribute='mac') | unique | length) == (ocp_nodes | length)
+      - (ocp_nodes | map(attribute='ip') | unique | length) == (ocp_nodes | length)
+      - (ocp_nodes | map(attribute='vmid') | unique | length) == (ocp_nodes | length)
+    fail_msg: "Need 1 (SNO, no workers) or 3 masters, and unique MAC/IP/VMID per node."
+
+- name: Generated IPs must not hit .0/.255 or the VIPs/gateway
+  ansible.builtin.assert:
+    that:
+      - (ocp_nodes | map(attribute='ip') | map('regex_search', '\.(0|255)$') | select | list | length) == 0
+      - (ocp_nodes | map(attribute='ip') | intersect([api_vip, ingress_vip, gateway]) | length) == 0
+    fail_msg: >-
+      Node IPs {{ ocp_nodes | map(attribute='ip') | join(', ') }} collide with a network/broadcast
+      address, a VIP or the gateway. Move ip_start or reduce the node count.
+
+- name: Check if an ISO already exists for this version
+  ansible.builtin.stat:
+    path: "{{ work_dir }}/{{ agent_iso_name }}"
+  register: agent_iso_stat
+
+- name: Build agent ISO
+  when: not agent_iso_stat.stat.exists or (agent_iso_rebuild | default(false) | bool)
+  block:
+    - name: Create clean build and config dirs
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: "{{ item.state }}"
+        mode: "0750"
+      loop:
+        - { path: "{{ work_dir }}/build", state: absent }
+        - { path: "{{ work_dir }}/build", state: directory }
+        - { path: "{{ work_dir }}/config", state: directory }
+
+    - name: Render install-config.yaml and agent-config.yaml
+      ansible.builtin.template:
+        src: "{{ item.0 }}.j2"
+        dest: "{{ work_dir }}/{{ item.1 }}/{{ item.0 }}"
+        mode: "0600"
+      loop: "{{ ['install-config.yaml', 'agent-config.yaml'] | product(['build', 'config']) | list }}"
+      loop_control:
+        label: "{{ item.1 }}/{{ item.0 }}"
+
+    - name: Add the Calico manifests to the agent install
+      ansible.builtin.include_tasks: calico.yml
+      when: cni == 'Calico'
+
+    - name: Run openshift-install agent create image
+      ansible.builtin.command:
+        cmd: "{{ ocp_install_bin }} agent create image --dir {{ work_dir }}/build --log-level info"
+      changed_when: true
+      # openshift-install runs `oc` itself to extract the base ISO
+      environment:
+        PATH: "{{ ocp_bin_dir }}:{{ lookup('ansible.builtin.env', 'PATH') }}"
+
+    - name: Store ISO and auth next to the cluster workdir
+      ansible.builtin.copy:
+        src: "{{ work_dir }}/build/{{ item.src }}"
+        dest: "{{ work_dir }}/{{ item.dest }}"
+        mode: "0600"
+      loop:
+        - { src: "agent.{{ ocp_arch }}.iso", dest: "{{ agent_iso_name }}" }
+        - { src: "auth/kubeconfig", dest: "kubeconfig" }
+        - { src: "auth/kubeadmin-password", dest: "kubeadmin-password" }

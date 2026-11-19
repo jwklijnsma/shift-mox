@@ -1,0 +1,108 @@
+# Self-repair for autoscale BareMetalHosts (see files/bmh-repair.sh).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: autoscale-bmh-repair
+  namespace: openshift-machine-api
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: autoscale-bmh-repair
+  namespace: openshift-machine-api
+rules:
+  - apiGroups: [metal3.io]
+    resources: [baremetalhosts]
+    verbs: [list]
+  # delete/patch only the autoscale hosts, never the masters or installed workers
+  - apiGroups: [metal3.io]
+    resources: [baremetalhosts]
+    resourceNames: {{ autoscale_pool | map(attribute='name') | list | to_json }}
+    verbs: [get, delete, patch]
+  - apiGroups: [metal3.io]
+    resources: [baremetalhosts]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: autoscale-bmh-repair
+  namespace: openshift-machine-api
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: autoscale-bmh-repair
+subjects:
+  - kind: ServiceAccount
+    name: autoscale-bmh-repair
+    namespace: openshift-machine-api
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: autoscale-bmh-repair
+  namespace: openshift-machine-api
+data:
+  bmh-repair.sh: |
+{{ lookup('ansible.builtin.file', 'bmh-repair.sh') | indent(4, true) }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: autoscale-bmh-manifests
+  namespace: openshift-machine-api
+data:
+{% for name, doc in ocp_autoscale_bmh_manifests.items() %}
+  {{ name }}.yaml: |
+{{ doc | indent(4, true) }}
+{% endfor %}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: autoscale-bmh-repair
+  namespace: openshift-machine-api
+spec:
+  schedule: "*/5 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 1500
+      template:
+        spec:
+          serviceAccountName: autoscale-bmh-repair
+          restartPolicy: Never
+          nodeSelector:
+            node-role.kubernetes.io/master: ""
+          tolerations:
+            - key: node-role.kubernetes.io/master
+              operator: Exists
+              effect: NoSchedule
+          containers:
+            - name: repair
+              image: {{ ocp_autoscale_cli_image }}
+              command: [/bin/bash, /scripts/bmh-repair.sh]
+              env:
+                - name: HOME
+                  value: /tmp
+                - name: MIN_AGE
+                  value: "{{ autoscale_repair_min_age | int }}"
+              resources:
+                requests: {cpu: 10m, memory: 64Mi}
+                limits: {memory: 256Mi}
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities: {drop: [ALL]}
+                runAsNonRoot: true
+                seccompProfile: {type: RuntimeDefault}
+              volumeMounts:
+                - {name: scripts, mountPath: /scripts}
+                - {name: manifests, mountPath: /manifests}
+          volumes:
+            - name: scripts
+              configMap: {name: autoscale-bmh-repair}
+            - name: manifests
+              configMap: {name: autoscale-bmh-manifests}

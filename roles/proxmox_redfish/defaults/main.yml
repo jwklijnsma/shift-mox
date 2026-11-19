@@ -1,0 +1,30 @@
+---
+proxmox_redfish_dir: /opt/proxmox-redfish
+proxmox_redfish_conf_dir: /etc/proxmox-redfish
+proxmox_redfish_user: proxmox-redfish
+proxmox_redfish_sushy_version: "2.2.0"
+# production WSGI server (>= 27 for --no-control-socket)
+proxmox_redfish_gunicorn_version: "27.0.1"
+# Slots the emulator may create VMs for (on_demand only)
+proxmox_redfish_slots: >-
+  {%- set ns = namespace(out=[]) -%}
+  {%- if autoscale_vm_provisioning == 'on_demand' -%}
+  {%-   for h in autoscale_pool -%}
+  {%-     set ns.out = ns.out + [{'name': h.name, 'vm_name': h.vm_name, 'pve_node': h.pve_node,
+            'cores': h.cores, 'memory': h.memory, 'disk_gb': h.disk_gb, 'mac': h.mac,
+            'storage': proxmox_disk_storage, 'bridge': proxmox_bridge, 'vlan': proxmox_vlan | default('') | string}] -%}
+  {%-   endfor -%}
+  {%- endif -%}
+  {{ ns.out }}
+# Read-only token for listing BareMetalHosts (set by autoscale.yml's first play)
+proxmox_redfish_k8s_token: "{{ hostvars['localhost']['ocp_autoscale_bmc_k8s_token'] | default('') }}"
+# DHCP with static leases for the autoscale slots (autoscale_dhcp)
+proxmox_redfish_dnsmasq: /usr/sbin/dnsmasq
+proxmox_redfish_netmask: >-
+  {%- set p = prefix_length | int -%}
+  {%- set ns = namespace(o=[]) -%}
+  {%- for i in range(4) -%}
+  {%-   set bits = [[p - 8 * i, 0] | max, 8] | min -%}
+  {%-   set ns.o = ns.o + [256 - 2 ** (8 - bits)] -%}
+  {%- endfor -%}
+  {{ ns.o | join('.') }}

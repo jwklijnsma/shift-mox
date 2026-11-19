@@ -1,0 +1,95 @@
+---
+# =============================================================================
+# Worker autoscaling on Proxmox VE  (ansible-playbook autoscale.yml)
+#
+#   ClusterAutoscaler / MachineAutoscaler      (OpenShift, scale on pending pods)
+#        │  or: Console > Compute > MachineSets > Edit Machine count
+#        ▼
+#   worker MachineSet ──► Machine ──► BareMetalHost (Metal3 / Ironic)
+#                                          │ redfish-virtualmedia
+#                                          ▼
+#   proxmox-redfish BMC (sushy-tools + Proxmox driver, runner LXC)
+#                                          │ Proxmox API: power, boot order, ISO
+#                                          ▼
+#   worker VMs on Proxmox: created when a worker is needed, deleted after
+#   scale-down (on_demand), or a pre-created pool made by kubemox (kubemox)
+#
+# Needs a cluster with platform baremetal (3 masters; not SNO).
+# =============================================================================
+autoscale_enabled: true
+
+# How the autoscale worker VMs come into existence:
+#   on_demand  the Redfish BMC creates a VM when OpenShift provisions a worker
+#              and deletes it again once the worker is scaled down. No idle
+#              VMs in Proxmox; scale-up takes a minute longer.
+#   kubemox    kubemox pre-creates every VM up front (stopped spare pool).
+autoscale_vm_provisioning: on_demand
+# on_demand: how long a scaled-down VM must be off (and its BareMetalHost
+# "available" again) before it is deleted.
+autoscale_vm_delete_grace: 300
+# A CronJob in openshift-machine-api re-registers autoscale hosts that have
+# been in an error state this long (seconds) and that no worker uses.
+autoscale_repair_min_age: 600
+# DHCP with static leases for the worker-auto MACs only, on the Redfish BMC
+# host. Makes sure a freshly installed worker has network (and its hostname)
+# on first boot. Other machines on the network are never answered.
+autoscale_dhcp: true
+
+# Worker count range for the autoscaler. min is never below the workers that
+# were installed with the cluster (ocp_worker_count); max decides how many
+# worker slots exist for autoscaling (max - ocp_worker_count).
+autoscale_min_workers: "{{ ocp_worker_count }}"
+autoscale_max_workers: 6
+
+# Size of the spare VMs (default: same as the installed workers).
+autoscale_worker_size: "{{ worker_size }}"
+# Proxmox nodes for the spare VMs (round-robin); default = cluster nodes.
+autoscale_proxmox_nodes: "{{ proxmox_nodes }}"
+# IPs/MACs continue after the last installed node (ip_start + node count),
+# using the same MAC scheme. Name: worker-auto-0.<cluster>, ...
+autoscale_name_prefix: worker-auto
+
+# ClusterAutoscaler behaviour
+autoscale_scale_down_enabled: true
+autoscale_scale_down_delay_after_add: 10m
+autoscale_scale_down_unneeded_time: 10m
+autoscale_scale_down_utilization_threshold: "0.5"
+autoscale_max_node_provision_time: 45m    # PXE-less ISO boot + RHCOS write + MCO reboot
+autoscale_cores_max: 256
+autoscale_memory_max_gib: 1024
+
+# No PTR records needed: MachineConfig 99-worker-openshift5-hosts puts all
+# nodes in /etc/hosts on the workers and sets a new worker's hostname by MAC.
+
+# --- kubemox (only with autoscale_vm_provisioning: kubemox) -------------------
+kubemox_chart_repo: https://alperencelik.github.io/helm-charts/
+kubemox_chart_version: "0.8.0"
+kubemox_image_tag: "v0.8.0"
+kubemox_namespace: kubemox
+# Namespace that holds the pool's VirtualMachine CRs + ProxmoxConnection secret
+autoscale_pool_namespace: proxmox-pool
+helm_version: "3.19.0"
+
+# --- Redfish BMC emulator for Proxmox ----------------------------------------
+# Runs as a systemd service on the inventory group "runner" (the runner LXC,
+# which sits on the cluster network); pick another host/group with
+# -e redfish_bmc_hosts=... and set redfish_bmc_address to its IP. Ironic on the masters must reach
+# redfish_bmc_address:redfish_bmc_port, and the emulator must reach both the
+# Proxmox API and the masters (it downloads the boot ISO from Ironic).
+redfish_bmc_address: "{{ runner_lxc_ip }}"
+redfish_bmc_port: 8443
+redfish_bmc_user: metal3
+# Put redfish_bmc_password in group_vars/all/vault.yml when the emulator and
+# the cluster part run from different machines (e.g. GitHub Actions). Without
+# it a random password is generated once and kept in the state dir.
+redfish_bmc_password: "{{ lookup('ansible.builtin.password', ocp_state_dir ~ '/redfish-bmc-password', chars=['ascii_letters', 'digits'], length=32) }}"
+# Proxmox token used by the emulator and kubemox (default: the deploy token).
+# A separate token with only PVEVMAdmin + Datastore.AllocateTemplate is tidier.
+autoscale_proxmox_token_user: "{{ proxmox_api_user }}"
+autoscale_proxmox_token_id: "{{ proxmox_api_token_id }}"
+autoscale_proxmox_token_secret: "{{ proxmox_api_token_secret }}"
+# Proxmox API address as seen from INSIDE the cluster (kubemox pods). On the
+# Proxmox host ocp.sh sets this to the host's IP on proxmox_bridge, because
+# proxmox_api_host is 127.0.0.1 there.
+autoscale_proxmox_api_host: "{{ proxmox_api_host }}"
+autoscale_proxmox_validate_certs: "{{ proxmox_validate_certs }}"

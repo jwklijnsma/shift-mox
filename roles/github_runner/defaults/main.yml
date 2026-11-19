@@ -1,0 +1,12 @@
+---
+github_runner_repo: jwklijnsma/shift-mox
+github_runner_user: ghrunner
+github_runner_dir: /opt/actions-runner
+github_runner_name: "{{ inventory_hostname }}"
+github_runner_labels: [proxmox]        # deploy.yml targets [self-hosted, linux, proxmox]
+github_runner_version: latest          # or a pinned version, e.g. "2.329.0"
+github_runner_pat: "{{ lookup('ansible.builtin.env', 'GITHUB_PAT') }}"
+github_runner_token: ""                # one-time registration token (runner.yml prompts for it)
+# Upstream nmstatectl for Debian (no nmstate package there)
+github_runner_nmstate_version: "2.2.55"
+github_runner_nmstate_sha256: a0aaa72e9fd1c9df35a875339268cbe8acafdf269cfbca2b7a4897ba4033aa69

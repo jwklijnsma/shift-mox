@@ -1,0 +1,109 @@
+---
+# Creates the self-hosted GitHub Actions runner as an LXC on the Proxmox host
+# and installs the runner in it.
+#
+#   ansible-playbook runner.yml --ask-vault-pass
+#
+# Needs: SSH as root to the Proxmox host (inventory group proxmox_host),
+#        python3-paramiko on your machine (for the pct connection).
+# Registration token: repo > Settings > Actions > Runners > "New self-hosted
+# runner" (valid 1 hour), or export GITHUB_PAT (fine-grained,
+# "Administration: read & write" on this repo) and it is fetched for you.
+
+- name: Create runner LXC on the Proxmox host
+  hosts: proxmox_host
+  gather_facts: false
+  module_defaults:
+    group/community.proxmox.proxmox: "{{ proxmox_auth }}"
+
+  tasks:
+    - name: Runner IP must not collide with nodes, VIPs or gateway
+      ansible.builtin.assert:
+        that: runner_lxc_ip not in (ocp_nodes | map(attribute='ip') | list + [api_vip, ingress_vip, gateway])
+        fail_msg: "runner_lxc_ip {{ runner_lxc_ip }} is already used by a node, a VIP or the gateway."
+        quiet: true
+
+    - name: Refresh template index
+      ansible.builtin.command: pveam update
+      changed_when: false
+
+    - name: Find newest matching Debian template
+      ansible.builtin.shell:
+        cmd: >-
+          set -o pipefail;
+          pveam available --section system | awk '{print $2}'
+          | grep -E '{{ runner_lxc_template_pattern }}' | sort -V | tail -n1
+        executable: /bin/bash
+      register: runner_tpl
+      changed_when: false
+      failed_when: runner_tpl.stdout | length == 0
+
+    - name: Download template {{ runner_tpl.stdout }}
+      ansible.builtin.shell:
+        cmd: >-
+          set -o pipefail; pveam list {{ runner_lxc_template_storage }} | grep -qF '{{ runner_tpl.stdout }}'
+          || { pveam download {{ runner_lxc_template_storage }} {{ runner_tpl.stdout }} && echo downloaded; }
+        executable: /bin/bash
+      register: runner_dl
+      changed_when: "'downloaded' in runner_dl.stdout"
+
+    - name: Create runner LXC
+      community.proxmox.proxmox:
+        node: "{{ runner_lxc_pve_node }}"
+        vmid: "{{ runner_lxc_vmid }}"
+        hostname: "{{ runner_lxc_hostname }}"
+        ostemplate: "{{ runner_lxc_template_storage }}:vztmpl/{{ runner_tpl.stdout }}"
+        unprivileged: true
+        features: [nesting=1]
+        cores: "{{ runner_lxc_cores }}"
+        memory: "{{ runner_lxc_memory }}"
+        swap: 512
+        disk: "{{ runner_lxc_storage }}:{{ runner_lxc_disk_gb }}"
+        netif:
+          net0: >-
+            name=eth0,bridge={{ proxmox_bridge }},ip={{ runner_lxc_ip }}/{{ prefix_length }},gw={{ gateway }}{{
+            (',tag=' ~ proxmox_vlan) if proxmox_vlan | string | length > 0 else '' }}
+        nameserver: "{{ dns_servers | join(' ') }}"
+        onboot: true
+        description: GitHub Actions runner for {{ cluster_name }} (managed by runner.yml)
+        tags: [github-runner, "{{ cluster_name }}"]
+        state: present
+      delegate_to: localhost
+
+    - name: Start runner LXC
+      community.proxmox.proxmox:
+        node: "{{ runner_lxc_pve_node }}"
+        vmid: "{{ runner_lxc_vmid }}"
+        state: started
+      delegate_to: localhost
+
+    - name: Wait until the LXC has outbound internet
+      ansible.builtin.command: "pct exec {{ runner_lxc_vmid }} -- getent hosts github.com"
+      register: runner_net
+      retries: 20
+      delay: 3
+      until: runner_net.rc == 0
+      changed_when: false
+
+    - name: Bootstrap python3 and sudo inside the LXC (needed by Ansible)
+      ansible.builtin.command:
+        cmd: >-
+          pct exec {{ runner_lxc_vmid }} -- sh -c
+          'command -v python3 >/dev/null && command -v sudo >/dev/null
+          || (apt-get update -q && DEBIAN_FRONTEND=noninteractive apt-get install -yq python3 sudo && echo installed)'
+      register: runner_boot
+      changed_when: "'installed' in runner_boot.stdout"
+
+- name: Install GitHub Actions runner in the LXC
+  hosts: runner
+  become: true
+  gather_facts: true
+
+  vars_prompt:
+    - name: github_runner_token
+      prompt: "Runner registration token (empty = use GITHUB_PAT, or runner already registered)"
+      private: true
+      default: ""
+
+  roles:
+    - role: github_runner

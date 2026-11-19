@@ -1,0 +1,11 @@
+.work/
+secrets/
+collections/
+group_vars/all/vault.yml.plain
+*.iso
+group_vars/all/vault.yml.bak
+__pycache__/
+*.pyc
+.DS_Store
+.ruff_cache/
+site/

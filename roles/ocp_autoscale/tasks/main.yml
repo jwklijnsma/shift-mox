@@ -1,0 +1,487 @@
+---
+# Worker autoscaling: worker slots (VMs on demand or kubemox pool) + Metal3 BareMetalHosts + autoscaler.
+- name: Autoscaling needs platform baremetal (3 masters)
+  ansible.builtin.assert:
+    that:
+      - not ocp_is_sno
+      - (autoscale_max_workers | int) >= (autoscale_min_workers | int)
+      - (autoscale_min_workers | int) >= 0
+      - autoscale_vm_provisioning in ['on_demand', 'kubemox']
+    fail_msg: >-
+      Autoscaling uses the Metal3 Machine API, which only exists with platform
+      baremetal (3 masters). Also check autoscale_min_workers <= autoscale_max_workers.
+    quiet: true
+
+- name: Proxmox address for kubemox must not be loopback (kubemox runs inside the cluster)
+  ansible.builtin.assert:
+    that: not (autoscale_proxmox_api_host is match('^127[.]|^localhost$'))
+    fail_msg: >-
+      autoscale_proxmox_api_host is {{ autoscale_proxmox_api_host }}. Set it to an address of the
+      Proxmox host that the cluster nodes can reach (./ocp.sh autoscale does this for you).
+    quiet: true
+  when: autoscale_vm_provisioning == 'kubemox'
+
+- name: Spare pool IPs must not collide with nodes, VIPs, gateway or the BMC
+  ansible.builtin.assert:
+    that: item.ip not in (ocp_nodes | map(attribute='ip') | list + [api_vip, ingress_vip, gateway, redfish_bmc_address])
+    fail_msg: "{{ item.name }} would get {{ item.ip }}, which is already used. Move ip_start or the runner/BMC IP."
+    quiet: true
+  loop: "{{ autoscale_pool }}"
+  loop_control:
+    label: "{{ item.name }} {{ item.ip }}"
+
+# --- /etc/hosts + hostname on workers (instead of PTR records) ---------------
+# New workers are installed by Metal3 with a static IP but no hostname. A
+# MachineConfig puts all nodes in /etc/hosts and sets the hostname by MAC
+# before NetworkManager starts, so no reverse DNS is needed.
+- name: Current MachineConfiguration (node disruption policy)
+  ansible.builtin.command:
+    argv: ["{{ oc_bin }}", get, machineconfiguration.operator.openshift.io, cluster, -o, json]
+  register: ocp_autoscale_mcfg
+  changed_when: false
+  failed_when: false
+
+- name: Don't reboot workers for the hosts MachineConfig (node disruption policy)
+  ansible.builtin.command:
+    argv: ["{{ oc_bin }}", patch, machineconfiguration.operator.openshift.io, cluster, --type=merge, -p, "{{ _patch | to_json }}"]
+  vars:
+    _ours_files: ["/etc/autoscale-hosts", "/usr/local/bin/autoscale-hosts.sh"]
+    _policy: "{{ ((ocp_autoscale_mcfg.stdout | default('{}', true) | from_json).spec | default({})).nodeDisruptionPolicy | default({}) }}"
+    _patch:
+      spec:
+        nodeDisruptionPolicy:
+          files: >-
+            {{ (_policy.files | default([]) | rejectattr('path', 'in', _ours_files) | list) + [
+                 {'path': '/etc/autoscale-hosts',
+                  'actions': [{'type': 'Restart', 'restart': {'serviceName': 'autoscale-hosts.service'}}]},
+                 {'path': '/usr/local/bin/autoscale-hosts.sh', 'actions': [{'type': 'None'}]}] }}
+          units: >-
+            {{ (_policy.units | default([]) | rejectattr('name', 'equalto', 'autoscale-hosts.service') | list) + [
+                 {'name': 'autoscale-hosts.service',
+                  'actions': [{'type': 'DaemonReload'}, {'type': 'Restart', 'restart': {'serviceName': 'autoscale-hosts.service'}}]}] }}
+  register: ocp_autoscale_ndp
+  when: ocp_autoscale_mcfg.rc == 0
+  changed_when: ocp_autoscale_ndp.rc == 0 and 'no change' not in ocp_autoscale_ndp.stdout
+  failed_when: false
+
+- name: Note when this cluster has no node disruption policies
+  ansible.builtin.debug:
+    msg: >-
+      This OpenShift version has no node disruption policies: the existing workers
+      reboot once (one at a time) when the hosts MachineConfig is first applied.
+  when: ocp_autoscale_mcfg.rc != 0 or (ocp_autoscale_ndp.rc | default(1)) != 0
+
+- name: MachineConfig 99-worker-openshift5-hosts (/etc/hosts + hostname by MAC)
+  ansible.builtin.command:
+    argv: ["{{ oc_bin }}", apply, -f, "-"]
+    stdin: "{{ lookup('ansible.builtin.template', 'hosts-machineconfig.yaml.j2') }}"
+  register: ocp_autoscale_mc_apply
+  changed_when: ocp_autoscale_mc_apply.stdout is search('created|configured')
+
+# --- helm + kubemox ----------------------------------------------------------
+- name: Spare pool pre-created by kubemox
+  when: autoscale_vm_provisioning == 'kubemox'
+  block:
+    - name: Helm directory
+      ansible.builtin.file:
+        path: "{{ helm_bin | dirname }}"
+        state: directory
+        mode: "0750"
+
+    - name: Download helm {{ helm_version }}
+      ansible.builtin.get_url:
+        url: "https://get.helm.sh/helm-v{{ helm_version }}-linux-amd64.tar.gz"
+        dest: "{{ helm_bin | dirname }}/helm.tar.gz"
+        checksum: "sha256:https://get.helm.sh/helm-v{{ helm_version }}-linux-amd64.tar.gz.sha256sum"
+        mode: "0640"
+
+    - name: Unpack helm
+      ansible.builtin.unarchive:
+        src: "{{ helm_bin | dirname }}/helm.tar.gz"
+        dest: "{{ helm_bin | dirname }}"
+        extra_opts: [--strip-components=1, linux-amd64/helm]
+        creates: "{{ helm_bin }}"
+
+    - name: Install / upgrade kubemox {{ kubemox_chart_version }}
+      ansible.builtin.command:
+        argv:
+          - "{{ helm_bin }}"
+          - upgrade
+          - --install
+          - kubemox
+          - kubemox
+          - --repo
+          - "{{ kubemox_chart_repo }}"
+          - --version
+          - "{{ kubemox_chart_version }}"
+          - --namespace
+          - "{{ kubemox_namespace }}"
+          - --create-namespace
+          - --set
+          - "image.tag={{ kubemox_image_tag }}"
+          - --set
+          - image.pullPolicy=IfNotPresent
+          - --wait
+          - --timeout
+          - 10m
+      register: ocp_autoscale_helm
+      changed_when: true
+
+    - name: Wait for the kubemox CRDs
+      ansible.builtin.command:
+        argv: ["{{ oc_bin }}", wait, --for=condition=Established, --timeout=120s,
+               crd/virtualmachines.proxmox.alperen.cloud, crd/proxmoxconnections.proxmox.alperen.cloud]
+      changed_when: false
+
+    - name: Spare pool VMs (kubemox VirtualMachine CRs)
+      ansible.builtin.command:
+        argv: ["{{ oc_bin }}", apply, -f, "-"]
+        stdin: "{{ lookup('ansible.builtin.template', 'kubemox-pool.yaml.j2') }}"
+      register: ocp_autoscale_pool_apply
+      changed_when: ocp_autoscale_pool_apply.stdout is search('created|configured')
+      no_log: true     # carries the Proxmox token
+
+    - name: Wait until kubemox has created every spare VM in Proxmox
+      ansible.builtin.uri:
+        url: "https://{{ proxmox_api_host }}:{{ proxmox_api_port }}/api2/json/cluster/resources?type=vm"
+        headers:
+          Authorization: "PVEAPIToken={{ proxmox_api_user }}!{{ proxmox_api_token_id }}={{ proxmox_api_token_secret }}"
+        validate_certs: "{{ proxmox_validate_certs }}"
+      register: ocp_autoscale_vms
+      no_log: true
+      retries: 40
+      delay: 15
+      until: >-
+        ocp_autoscale_vms.status == 200 and
+        (autoscale_pool | map(attribute='vm_name')
+         | difference(ocp_autoscale_vms.json.data | selectattr('name', 'defined') | map(attribute='name') | list)
+         | length == 0)
+
+# on_demand: VMs that an earlier kubemox run pre-created are removed, unless a
+# worker already runs on one. The Redfish BMC creates VMs from now on.
+- name: Pre-created kubemox VMs from an earlier run
+  when: autoscale_vm_provisioning == 'on_demand'
+  block:
+    - name: Is kubemox installed?
+      ansible.builtin.command:
+        argv: ["{{ oc_bin }}", get, crd, virtualmachines.proxmox.alperen.cloud, -o, name]
+      register: ocp_autoscale_kubemox_crd
+      changed_when: false
+      failed_when: false
+
+    - name: List kubemox autoscale VMs and BareMetalHosts
+      ansible.builtin.command:
+        argv: ["{{ oc_bin }}", get, "{{ item }}", -A, -l, openshift5/role=autoscale-worker, -o, json]
+      loop: [virtualmachines.proxmox.alperen.cloud, baremetalhosts.metal3.io]
+      register: ocp_autoscale_old
+      changed_when: false
+      when: ocp_autoscale_kubemox_crd.rc == 0
+
+    # Don't rely on kubemox to clean up (its finalizer hangs when the operator
+    # isn't working): drop the finalizer, delete the CR, delete the VM ourselves.
+    - name: Find the kubemox VMs that no worker runs on
+      ansible.builtin.set_fact:
+        ocp_autoscale_free: "{{ _vms | rejectattr('metadata.name', 'in', _busy) | list }}"
+      vars:
+        _vms: "{{ (ocp_autoscale_old.results[0].stdout | from_json)['items'] }}"
+        _busy: >-
+          {{ (ocp_autoscale_old.results[1].stdout | from_json)['items']
+             | selectattr('spec.consumerRef', 'defined') | map(attribute='metadata.name') | list }}
+      when: ocp_autoscale_kubemox_crd.rc == 0
+
+    - name: Delete their VirtualMachine resources (without waiting for kubemox)
+      ansible.builtin.command:
+        argv: ["{{ oc_bin }}", -n, "{{ item.metadata.namespace }}", delete,
+               virtualmachines.proxmox.alperen.cloud, "{{ item.metadata.name }}", --wait=false, --ignore-not-found]
+      loop: "{{ ocp_autoscale_free | default([]) }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+      changed_when: true
+
+    - name: Remove kubemox's finalizer so the resources really go away
+      ansible.builtin.command:
+        argv: ["{{ oc_bin }}", -n, "{{ item.metadata.namespace }}", patch,
+               virtualmachines.proxmox.alperen.cloud, "{{ item.metadata.name }}",
+               --type=merge, -p, '{"metadata":{"finalizers":null}}']
+      loop: "{{ ocp_autoscale_free | default([]) }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+      register: ocp_autoscale_unfinalize
+      changed_when: ocp_autoscale_unfinalize.rc == 0
+      failed_when: ocp_autoscale_unfinalize.rc != 0 and 'NotFound' not in ocp_autoscale_unfinalize.stderr
+
+    - name: VMs in Proxmox
+      ansible.builtin.uri:
+        url: "https://{{ proxmox_api_host }}:{{ proxmox_api_port }}/api2/json/cluster/resources?type=vm"
+        headers:
+          Authorization: "PVEAPIToken={{ proxmox_api_user }}!{{ proxmox_api_token_id }}={{ proxmox_api_token_secret }}"
+        validate_certs: "{{ proxmox_validate_certs }}"
+      register: ocp_autoscale_pve_vms
+      no_log: true
+      when: ocp_autoscale_free | default([]) | length > 0
+
+    - name: Stop and delete those VMs in Proxmox
+      community.proxmox.proxmox_kvm:
+        node: "{{ item.node }}"
+        vmid: "{{ item.vmid }}"
+        state: absent
+        force: true
+      module_defaults:
+        group/community.proxmox.proxmox: "{{ proxmox_auth }}"
+      loop: >-
+        {{ ocp_autoscale_pve_vms.json.data | default([]) | selectattr('name', 'defined')
+           | selectattr('name', 'in', ocp_autoscale_free | default([]) | map(attribute='spec.name') | list)
+           | list }}
+      loop_control:
+        label: "{{ item.name }} ({{ item.vmid }})"
+      when: ocp_autoscale_free | default([]) | length > 0
+
+# --- Metal3 -------------------------------------------------------------------
+- name: Is Metal3 provisioning configured?
+  ansible.builtin.command:
+    argv: ["{{ oc_bin }}", get, provisioning, provisioning-configuration, -o, name]
+  register: ocp_autoscale_prov
+  changed_when: false
+  failed_when: false
+
+- name: Enable Metal3 without a provisioning network (virtual media over the machine network)
+  ansible.builtin.command:
+    argv: ["{{ oc_bin }}", apply, -f, "-"]
+    stdin: |
+      apiVersion: metal3.io/v1alpha1
+      kind: Provisioning
+      metadata:
+        name: provisioning-configuration
+      spec:
+        provisioningNetwork: Disabled
+        watchAllNamespaces: false
+  when: ocp_autoscale_prov.rc != 0
+  changed_when: true
+
+- name: Wait for the metal3 pod
+  ansible.builtin.command:
+    argv: ["{{ oc_bin }}", -n, openshift-machine-api, wait, --for=condition=Available,
+           --timeout=900s, deployment/metal3]
+  changed_when: false
+
+- name: Wait until the worker pool runs the hosts MachineConfig
+  ansible.builtin.command:
+    argv:
+      - "{{ oc_bin }}"
+      - get
+      - mcp/worker
+      - -o
+      - jsonpath={.status.configuration.source[*].name}|{.status.conditions[?(@.type=="Updated")].status}
+  register: ocp_autoscale_mcp
+  changed_when: false
+  retries: 120     # up to 60 min: a rolling reboot when there is no disruption policy
+  delay: 30
+  until: >-
+    ocp_autoscale_mcp.rc == 0 and
+    '99-worker-openshift5-hosts' in ocp_autoscale_mcp.stdout.split('|')[0] and
+    ocp_autoscale_mcp.stdout.split('|')[-1] == 'True'
+
+# --- Repair: autoscale hosts stuck in an error state ---------------------------
+# A slot host that ended up in e.g. "inspection error" (for instance because an
+# old VM was still there when it registered) and that no worker uses is removed
+# together with any VM for it, and registered fresh by the apply below.
+- name: Autoscale BareMetalHosts (to find broken ones)
+  ansible.builtin.command:
+    argv: ["{{ oc_bin }}", -n, openshift-machine-api, get, baremetalhosts.metal3.io,
+           -l, openshift5/role=autoscale-worker, -o, json]
+  register: ocp_autoscale_bmh_now
+  changed_when: false
+
+- name: Find broken, unused autoscale hosts
+  ansible.builtin.set_fact:
+    ocp_autoscale_broken: >-
+      {%- set ns = namespace(out=[]) -%}
+      {%- for b in (ocp_autoscale_bmh_now.stdout | from_json)['items'] -%}
+      {%-   set st = b.status | default({}) -%}
+      {%-   if (st.errorType | default('') | length > 0 or st.operationalStatus | default('') == 'error')
+              and b.spec.consumerRef is not defined -%}
+      {%-     set ns.out = ns.out + [{'name': b.metadata.name,
+                'error': (st.errorType | default('')) ~ ': ' ~ (st.errorMessage | default('') | truncate(200))}] -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ ns.out }}
+
+- name: Repair broken autoscale hosts
+  when: ocp_autoscale_broken | length > 0
+  block:
+    - name: Broken hosts that will be registered again
+      ansible.builtin.debug:
+        msg: "{{ ocp_autoscale_broken }}"
+
+    - name: Delete the broken BareMetalHosts
+      ansible.builtin.command:
+        argv: ["{{ oc_bin }}", -n, openshift-machine-api, delete, baremetalhosts.metal3.io,
+               "{{ item.name }}", --wait=true, --timeout=600s, --ignore-not-found]
+      loop: "{{ ocp_autoscale_broken }}"
+      loop_control:
+        label: "{{ item.name }}"
+      changed_when: true
+
+    - name: VMs in Proxmox (leftovers of the broken hosts)
+      ansible.builtin.uri:
+        url: "https://{{ proxmox_api_host }}:{{ proxmox_api_port }}/api2/json/cluster/resources?type=vm"
+        headers:
+          Authorization: "PVEAPIToken={{ proxmox_api_user }}!{{ proxmox_api_token_id }}={{ proxmox_api_token_secret }}"
+        validate_certs: "{{ proxmox_validate_certs }}"
+      register: ocp_autoscale_pve_vms2
+      no_log: true
+      when: autoscale_vm_provisioning == 'on_demand'
+
+    - name: Delete leftover VMs of the broken hosts (on demand, the VM comes back when needed)
+      community.proxmox.proxmox_kvm:
+        node: "{{ item.node }}"
+        vmid: "{{ item.vmid }}"
+        state: absent
+        force: true
+      module_defaults:
+        group/community.proxmox.proxmox: "{{ proxmox_auth }}"
+      loop: >-
+        {{ ocp_autoscale_pve_vms2.json.data | default([]) | selectattr('name', 'defined')
+           | selectattr('name', 'in', autoscale_pool | selectattr('name', 'in', ocp_autoscale_broken | map(attribute='name') | list)
+                                                       | map(attribute='vm_name') | list)
+           | list }}
+      loop_control:
+        label: "{{ item.name }} ({{ item.vmid }})"
+      when: autoscale_vm_provisioning == 'on_demand'
+
+- name: Does this BareMetalHost API have spec.inspectionMode?
+  ansible.builtin.command:
+    argv: ["{{ oc_bin }}", explain, baremetalhosts.spec.inspectionMode, --api-version=metal3.io/v1alpha1]
+  register: ocp_autoscale_inspmode
+  changed_when: false
+  failed_when: false
+
+- name: Autoscale hosts a worker runs on (never re-applied)
+  ansible.builtin.command:
+    argv: ["{{ oc_bin }}", -n, openshift-machine-api, get, baremetalhosts.metal3.io,
+           -l, openshift5/role=autoscale-worker, -o, json]
+  register: ocp_autoscale_bmh_claimed
+  changed_when: false
+
+# Re-applying a host that a worker runs on would reset spec.online to false
+# and power the worker off. Claimed hosts are left completely alone.
+- name: BareMetalHosts for the free slots (BMC = Proxmox Redfish emulator)
+  ansible.builtin.command:
+    argv: ["{{ oc_bin }}", apply, -f, "-"]
+    stdin: "{{ {'apiVersion': 'v1', 'kind': 'List', 'items': _apply} | to_json }}"
+  vars:
+    _docs: "{{ lookup('ansible.builtin.template', 'baremetalhosts.yaml.j2') | from_yaml_all | select | list }}"
+    _claimed: >-
+      {{ (ocp_autoscale_bmh_claimed.stdout | from_json)['items']
+         | selectattr('spec.consumerRef', 'defined') | map(attribute='metadata.name') | list }}
+    _apply: >-
+      {{ (_docs | rejectattr('kind', 'equalto', 'BareMetalHost') | list)
+         + (_docs | selectattr('kind', 'equalto', 'BareMetalHost')
+                  | rejectattr('metadata.name', 'in', _claimed) | list) }}
+  register: ocp_autoscale_bmh_apply
+  changed_when: ocp_autoscale_bmh_apply.stdout is search('created|configured')
+  no_log: true     # carries the BMC password
+
+# --- In-cluster self-repair (CronJob) --------------------------------------
+# Every 5 minutes: autoscale hosts stuck in an error state for
+# autoscale_repair_min_age and not used by a worker are registered again.
+- name: CLI image of this OpenShift release (for the repair CronJob)
+  ansible.builtin.command:
+    argv: ["{{ oc_bin }}", -n, openshift, get, istag, "cli:latest", -o, "jsonpath={.image.dockerImageReference}"]
+  register: ocp_autoscale_cli_istag
+  changed_when: false
+  failed_when: false
+
+- name: CLI image from the release payload (fallback)
+  ansible.builtin.command:
+    argv: ["{{ oc_bin }}", adm, release, info, --image-for=cli]
+  register: ocp_autoscale_cli_release
+  changed_when: false
+  when: ocp_autoscale_cli_istag.rc != 0 or ocp_autoscale_cli_istag.stdout | length == 0
+
+- name: BareMetalHost definitions the repair job re-creates hosts from (no secrets)
+  ansible.builtin.set_fact:
+    ocp_autoscale_cli_image: >-
+      {{ ocp_autoscale_cli_istag.stdout if (ocp_autoscale_cli_istag.stdout | default('') | length > 0)
+         else ocp_autoscale_cli_release.stdout | trim }}
+    ocp_autoscale_bmh_manifests: >-
+      {%- set ns = namespace(out={}) -%}
+      {%- for d in lookup('ansible.builtin.template', 'baremetalhosts.yaml.j2') | from_yaml_all -%}
+      {%-   if d and d.kind == 'BareMetalHost' -%}
+      {%-     set ns.out = ns.out | combine({d.metadata.name: d | to_nice_yaml(indent=2)}) -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ ns.out }}
+
+- name: Repair CronJob, its RBAC and the host definitions
+  ansible.builtin.command:
+    argv: ["{{ oc_bin }}", apply, -f, "-"]
+    stdin: "{{ lookup('ansible.builtin.template', 'bmh-repair.yaml.j2') }}"
+  register: ocp_autoscale_repair_apply
+  changed_when: ocp_autoscale_repair_apply.stdout is search('created|configured')
+
+# --- autoscaler --------------------------------------------------------------
+- name: Find the worker MachineSet
+  ansible.builtin.command:
+    argv: ["{{ oc_bin }}", -n, openshift-machine-api, get, machinesets.machine.openshift.io, -o, json]
+  register: ocp_autoscale_ms
+  changed_when: false
+
+- name: Count worker Machines (agent-installed workers may have none)
+  ansible.builtin.command:
+    argv: ["{{ oc_bin }}", -n, openshift-machine-api, get, machines.machine.openshift.io,
+           -l, machine.openshift.io/cluster-api-machine-role=worker, -o, name]
+  register: ocp_autoscale_machines
+  changed_when: false
+
+- name: Use the first MachineSet with role worker
+  ansible.builtin.set_fact:
+    ocp_autoscale_machineset: "{{ _workers[0][0] }}"
+    ocp_autoscale_ms_replicas: "{{ _workers[0][1] | int }}"
+    ocp_autoscale_min_effective: "{{ autoscale_min_workers | int }}"
+  vars:
+    _workers: >-
+      {%- set ns = namespace(out=[]) -%}
+      {%- for m in (ocp_autoscale_ms.stdout | from_json)['items'] -%}
+        {%- set labels = m.spec.template.metadata.labels | default({}) -%}
+        {%- if labels['machine.openshift.io/cluster-api-machine-role'] | default('') == 'worker' -%}
+          {%- set ns.out = ns.out + [[m.metadata.name, m.spec.replicas | default(0)]] -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ ns.out }}
+  failed_when: _workers | length == 0
+
+- name: Warn when the MachineSet expects more workers than there are Machines
+  ansible.builtin.debug:
+    msg: >-
+      MachineSet {{ ocp_autoscale_machineset }} wants {{ ocp_autoscale_ms_replicas }} replicas but only
+      {{ ocp_autoscale_machines.stdout_lines | length }} worker Machines exist (agent-installed workers
+      without a Machine). The MachineSet will provision spare VMs to make up the difference.
+  when: (ocp_autoscale_ms_replicas | int) > (ocp_autoscale_machines.stdout_lines | length)
+
+- name: ClusterAutoscaler + MachineAutoscaler
+  ansible.builtin.command:
+    argv: ["{{ oc_bin }}", apply, -f, "-"]
+    stdin: "{{ lookup('ansible.builtin.template', 'autoscaler.yaml.j2') }}"
+  register: ocp_autoscale_as_apply
+  changed_when: ocp_autoscale_as_apply.stdout is search('created|configured')
+
+- name: BareMetalHost state
+  ansible.builtin.command:
+    argv: ["{{ oc_bin }}", -n, openshift-machine-api, get, bmh, -l, openshift5/role=autoscale-worker]
+  register: ocp_autoscale_bmh
+  changed_when: false
+
+- name: Done
+  vars:
+    _bmh_note:
+      on_demand: slots turn 'available' without a VM; the VM is created on scale-up
+      kubemox: spare VMs turn 'available' after inspection, ~5-10 min
+  ansible.builtin.debug:
+    msg:
+      - "Worker slots ({{ autoscale_vm_provisioning }}): {{ autoscale_pool | map(attribute='name') | join(', ') or 'none' }}"
+      - "MachineSet {{ ocp_autoscale_machineset }}: autoscaling {{ ocp_autoscale_min_effective }}..{{ autoscale_max_workers }} workers"
+      - "Console:  Compute > MachineSets > {{ ocp_autoscale_machineset }} > Edit Machine count"
+      - "          Compute > Bare Metal Hosts ({{ _bmh_note[autoscale_vm_provisioning] }})"
+      - "CLI:      oc -n openshift-machine-api scale machineset {{ ocp_autoscale_machineset }} --replicas=N"
+      - "{{ ocp_autoscale_bmh.stdout_lines }}"

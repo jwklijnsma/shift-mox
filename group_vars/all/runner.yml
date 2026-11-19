@@ -1,0 +1,15 @@
+---
+# Self-hosted GitHub runner, created as an LXC on the Proxmox host by runner.yml.
+# It sits on the cluster network, so it reaches the nodes directly and only
+# needs outbound HTTPS to GitHub - no inbound ports anywhere.
+runner_lxc_vmid: 5099
+runner_lxc_hostname: gh-runner
+runner_lxc_pve_node: "{{ proxmox_iso_node }}"
+runner_lxc_cores: 2
+runner_lxc_memory: 4096
+runner_lxc_disk_gb: 40
+runner_lxc_storage: "{{ proxmox_disk_storage }}"
+runner_lxc_ip: 192.168.50.5           # on machine_network, outside the node IP range
+# Highest matching template from `pveam available` is downloaded automatically
+runner_lxc_template_pattern: '^debian-(13|12)-standard_.*_amd64\.tar\.zst$'
+runner_lxc_template_storage: local    # storage with content "vztmpl"

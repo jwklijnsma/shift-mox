@@ -1,0 +1,33 @@
+apiVersion: autoscaling.openshift.io/v1
+kind: ClusterAutoscaler
+metadata:
+  name: default
+spec:
+  podPriorityThreshold: -10
+  maxNodeProvisionTime: {{ autoscale_max_node_provision_time }}
+  resourceLimits:
+    maxNodesTotal: {{ (ocp_masters | length) + (autoscale_max_workers | int) }}
+    cores:
+      min: 0
+      max: {{ autoscale_cores_max }}
+    memory:
+      min: 0
+      max: {{ autoscale_memory_max_gib }}
+  scaleDown:
+    enabled: {{ autoscale_scale_down_enabled | bool | to_json }}
+    delayAfterAdd: {{ autoscale_scale_down_delay_after_add }}
+    unneededTime: {{ autoscale_scale_down_unneeded_time }}
+    utilizationThreshold: "{{ autoscale_scale_down_utilization_threshold }}"
+---
+apiVersion: autoscaling.openshift.io/v1beta1
+kind: MachineAutoscaler
+metadata:
+  name: {{ ocp_autoscale_machineset }}
+  namespace: openshift-machine-api
+spec:
+  minReplicas: {{ ocp_autoscale_min_effective }}
+  maxReplicas: {{ autoscale_max_workers | int }}
+  scaleTargetRef:
+    apiVersion: machine.openshift.io/v1beta1
+    kind: MachineSet
+    name: {{ ocp_autoscale_machineset }}

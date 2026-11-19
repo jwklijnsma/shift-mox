@@ -1,0 +1,35 @@
+[Unit]
+Description=Redfish BMC emulator for Proxmox VE VMs (OpenShift Metal3 autoscaling)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User={{ proxmox_redfish_user }}
+Group={{ proxmox_redfish_user }}
+WorkingDirectory={{ proxmox_redfish_dir }}
+Environment=TMPDIR={{ proxmox_redfish_dir }}/tmp
+Environment=SUSHY_EMULATOR_CONFIG={{ proxmox_redfish_conf_dir }}/emulator.conf
+# Production WSGI server. One worker process on purpose (in-process VM cache
+# and reaper thread); threads serve Ironic's parallel requests. A virtual
+# media insert (ISO download + upload) can take minutes - it only holds a
+# thread, the worker keeps heart-beating.
+ExecStart={{ proxmox_redfish_dir }}/venv/bin/gunicorn \
+    --chdir {{ proxmox_redfish_dir }} \
+    --workers 1 --worker-class gthread --threads 8 \
+    --bind {{ redfish_bmc_address }}:{{ redfish_bmc_port }} \
+    --certfile {{ proxmox_redfish_conf_dir }}/tls.crt \
+    --keyfile {{ proxmox_redfish_conf_dir }}/tls.key \
+    --timeout 120 --graceful-timeout 30 --no-control-socket \
+    --worker-tmp-dir {{ proxmox_redfish_dir }}/tmp \
+    --access-logfile - --error-logfile - \
+    proxmox_redfish:app
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths={{ proxmox_redfish_dir }}/tmp
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

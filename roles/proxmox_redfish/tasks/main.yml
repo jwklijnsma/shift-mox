@@ -1,0 +1,229 @@
+---
+# Redfish BMC emulator (sushy-tools + Proxmox driver) as a systemd service.
+- name: Install packages (Debian/Ubuntu)
+  ansible.builtin.apt:
+    name: [python3, python3-venv, openssl]
+    update_cache: true
+  when: ansible_os_family == "Debian"
+
+- name: Install packages (RHEL/Fedora)
+  ansible.builtin.dnf:
+    name: [python3, openssl]
+  when: ansible_os_family == "RedHat"
+
+- name: Service user
+  ansible.builtin.user:
+    name: "{{ proxmox_redfish_user }}"
+    system: true
+    shell: /usr/sbin/nologin
+    create_home: false
+
+- name: Directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ proxmox_redfish_user }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ proxmox_redfish_dir }}", owner: root, mode: "0755" }
+    - { path: "{{ proxmox_redfish_dir }}/tmp", owner: "{{ proxmox_redfish_user }}", mode: "0750" }
+    - { path: "{{ proxmox_redfish_conf_dir }}", owner: root, mode: "0750" }
+
+- name: Python venv with sushy-tools and proxmoxer
+  ansible.builtin.pip:
+    name:
+      - "sushy-tools=={{ proxmox_redfish_sushy_version }}"
+      - "gunicorn=={{ proxmox_redfish_gunicorn_version }}"
+      - proxmoxer
+      - requests
+      - requests-toolbelt
+      - bcrypt
+    virtualenv: "{{ proxmox_redfish_dir }}/venv"
+    virtualenv_command: python3 -m venv
+  notify: Restart proxmox-redfish
+
+- name: Proxmox driver
+  ansible.builtin.copy:
+    src: proxmox_redfish.py
+    dest: "{{ proxmox_redfish_dir }}/proxmox_redfish.py"
+    mode: "0755"
+  notify: Restart proxmox-redfish
+
+- name: Self-signed TLS certificate (Ironic is told to skip verification)
+  ansible.builtin.command:
+    argv: [openssl, req, -x509, -newkey, "rsa:3072", -nodes, -days, "3650",
+           -subj, "/CN={{ redfish_bmc_address }}",
+           -addext, "subjectAltName=IP:{{ redfish_bmc_address }}",
+           -keyout, "{{ proxmox_redfish_conf_dir }}/tls.key",
+           -out, "{{ proxmox_redfish_conf_dir }}/tls.crt"]
+    creates: "{{ proxmox_redfish_conf_dir }}/tls.crt"
+  notify: Restart proxmox-redfish
+
+- name: Basic-auth file (bcrypt), rewritten only when the password changed
+  ansible.builtin.command:
+    argv:
+      - "{{ proxmox_redfish_dir }}/venv/bin/python"
+      - -I
+      - -c
+      - |
+        import bcrypt, os, sys
+        path, user, pw = sys.argv[1], sys.argv[2], os.environ["BMC_PW"].encode()
+        try:
+            u, h = open(path).read().strip().split(":", 1)
+            if u == user and bcrypt.checkpw(pw, h.encode()):
+                sys.exit(0)
+        except (OSError, ValueError):
+            pass
+        open(path, "w").write(f"{user}:{bcrypt.hashpw(pw, bcrypt.gensalt()).decode()}\n")
+        print("changed")
+      - "{{ proxmox_redfish_conf_dir }}/htpasswd"
+      - "{{ redfish_bmc_user }}"
+  environment:
+    BMC_PW: "{{ redfish_bmc_password }}"
+  register: proxmox_redfish_htpasswd
+  changed_when: "'changed' in proxmox_redfish_htpasswd.stdout"
+  no_log: true
+  notify: Restart proxmox-redfish
+
+- name: Emulator config (holds the Proxmox token)
+  ansible.builtin.template:
+    src: emulator.conf.j2
+    dest: "{{ proxmox_redfish_conf_dir }}/emulator.conf"
+    mode: "0640"
+    group: "{{ proxmox_redfish_user }}"
+  no_log: true
+  notify: Restart proxmox-redfish
+
+- name: Key, cert and htpasswd readable by the service only
+  ansible.builtin.file:
+    path: "{{ proxmox_redfish_conf_dir }}/{{ item }}"
+    owner: root
+    group: "{{ proxmox_redfish_user }}"
+    mode: "0640"
+  loop: [tls.key, tls.crt, htpasswd]
+
+- name: Systemd unit
+  ansible.builtin.template:
+    src: proxmox-redfish.service.j2
+    dest: /etc/systemd/system/proxmox-redfish.service
+    mode: "0644"
+  notify: Restart proxmox-redfish
+
+- name: Enable and start
+  ansible.builtin.systemd_service:
+    name: proxmox-redfish
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Apply restarts now
+  ansible.builtin.meta: flush_handlers
+
+# --- DHCP for the autoscale slots ---------------------------------------------
+- name: DHCP for the autoscale slots
+  when: autoscale_dhcp | bool
+  block:
+    - name: Install dnsmasq (binary only, no DNS service)
+      ansible.builtin.package:
+        name: "{{ 'dnsmasq-base' if ansible_os_family == 'Debian' else 'dnsmasq' }}"
+
+    - name: DHCP config (static leases for the slot MACs only)
+      ansible.builtin.template:
+        src: dhcp.conf.j2
+        dest: "{{ proxmox_redfish_conf_dir }}/dhcp.conf"
+        mode: "0644"
+      notify: Restart proxmox-redfish-dhcp
+
+    - name: DHCP systemd unit
+      ansible.builtin.template:
+        src: proxmox-redfish-dhcp.service.j2
+        dest: /etc/systemd/system/proxmox-redfish-dhcp.service
+        mode: "0644"
+      notify: Restart proxmox-redfish-dhcp
+
+    - name: Enable and start DHCP
+      ansible.builtin.systemd_service:
+        name: proxmox-redfish-dhcp
+        enabled: true
+        state: started
+        daemon_reload: true
+
+- name: No DHCP for the autoscale slots
+  ansible.builtin.systemd_service:
+    name: proxmox-redfish-dhcp
+    enabled: false
+    state: stopped
+  when: not (autoscale_dhcp | bool)
+  failed_when: false
+
+- name: Apply DHCP restarts now
+  ansible.builtin.meta: flush_handlers
+
+# --- Serial console recording (only on a Proxmox host: needs qm + the sockets)
+- name: Is this a Proxmox VE host?
+  ansible.builtin.stat:
+    path: /usr/sbin/qm
+  register: proxmox_redfish_qm
+
+- name: Record autoscale worker consoles to /var/log/proxmox-redfish
+  when: proxmox_redfish_qm.stat.exists
+  block:
+    - name: Install socat
+      ansible.builtin.package:
+        name: socat
+
+    - name: Console recorder script
+      ansible.builtin.copy:
+        src: proxmox-redfish-console.sh
+        dest: /usr/local/sbin/proxmox-redfish-console.sh
+        mode: "0755"
+      notify: Restart proxmox-redfish-console
+
+    - name: Console recorder unit
+      ansible.builtin.template:
+        src: proxmox-redfish-console.service.j2
+        dest: /etc/systemd/system/proxmox-redfish-console.service
+        mode: "0644"
+      notify: Restart proxmox-redfish-console
+
+    - name: Rotate the console logs
+      ansible.builtin.copy:
+        dest: /etc/logrotate.d/proxmox-redfish-console
+        mode: "0644"
+        content: |
+          /var/log/proxmox-redfish/*.log {
+              size 20M
+              rotate 3
+              compress
+              missingok
+              notifempty
+              copytruncate
+          }
+
+    - name: Enable and start the console recorder
+      ansible.builtin.systemd_service:
+        name: proxmox-redfish-console
+        enabled: true
+        state: started
+        daemon_reload: true
+
+- name: Apply console recorder restarts now
+  ansible.builtin.meta: flush_handlers
+
+- name: Redfish answers and sees the spare pool VMs
+  ansible.builtin.uri:
+    url: "https://{{ redfish_bmc_address }}:{{ redfish_bmc_port }}/redfish/v1/Systems"
+    url_username: "{{ redfish_bmc_user }}"
+    url_password: "{{ redfish_bmc_password }}"
+    force_basic_auth: true
+    validate_certs: false
+  register: proxmox_redfish_systems
+  retries: 10
+  delay: 3
+  until: proxmox_redfish_systems.status == 200
+  no_log: true
+
+- name: Systems exposed by the emulator
+  ansible.builtin.debug:
+    msg: "{{ proxmox_redfish_systems.json['Members@odata.count'] }} VM(s) match {{ autoscale_vm_name_regex }}"

@@ -1,0 +1,89 @@
+---
+# Computed values - normally no need to edit.
+# --- OpenShift vs OKD --------------------------------------------------------
+ocp_is_okd: "{{ ocp_distribution | default('ocp') == 'okd' }}"
+ocp_release: "{{ okd_version if ocp_is_okd else ocp_version }}"
+# OKD release assets carry the version in the file name; the OCP mirror doesn't
+ocp_download_base: >-
+  {{ ('https://github.com/okd-project/okd/releases/download/' ~ okd_version)
+     if ocp_is_okd else ocp_mirror_base }}
+ocp_tool_suffix: "{{ ('-' ~ okd_version) if ocp_is_okd else '' }}"
+ocp_tool_tarballs:
+  - "openshift-install-linux{{ ocp_tool_suffix }}.tar.gz"
+  - "openshift-client-linux{{ ocp_tool_suffix }}.tar.gz"
+# OKD needs no Red Hat pull secret; this placeholder is what the OKD docs use.
+okd_pull_secret: '{"auths":{"fake":{"auth":"aWQ6cGFzcwo="}}}'
+# Evaluated lazily, so the pull secret file is only read for OpenShift.
+ocp_pull_secret: >-
+  {{ okd_pull_secret if ocp_is_okd
+     else (lookup('ansible.builtin.file', pull_secret_file) | from_json | to_json) }}
+
+ocp_bin_dir: "{{ ocp_state_dir }}/bin/{{ ocp_release }}"
+ocp_install_bin: "{{ ocp_bin_dir }}/openshift-install"
+oc_bin: "{{ ocp_bin_dir }}/oc"
+
+# --- Automatic VM list -------------------------------------------------------
+ocp_nodes_generated: >-
+  {%- set ns = namespace(out=[]) -%}
+  {%- set o = ip_start.split('.') | map('int') | list -%}
+  {%- set base = o[0] * 16777216 + o[1] * 65536 + o[2] * 256 + o[3] -%}
+  {%- set roles = ['master'] * (ocp_master_count | int) + ['worker'] * (ocp_worker_count | int) -%}
+  {%- for role in roles -%}
+    {%- set i = loop.index0 -%}
+    {%- set idx = i if role == 'master' else i - (ocp_master_count | int) -%}
+    {%- set n = base + i -%}
+    {%- set b = [(n // 16777216) % 256, (n // 65536) % 256, (n // 256) % 256, n % 256] -%}
+    {%- set name = role ~ '-' ~ idx -%}
+    {%- set size = master_size if role == 'master' else worker_size -%}
+    {%- set node = {
+          'name': name,
+          'role': role,
+          'vmid': (vmid_start | int) + i,
+          'pve_node': proxmox_nodes[i % (proxmox_nodes | length)],
+          'ip': b | join('.'),
+          'mac': '52:54:00:%02x:%02x:%02x' | format(b[1], b[2], b[3]),
+        } | combine(size) | combine(node_overrides[name] | default({})) -%}
+    {%- set ns.out = ns.out + [node] -%}
+  {%- endfor -%}
+  {{ ns.out }}
+
+ocp_nodes: "{{ ocp_nodes_manual if (ocp_nodes_manual | length) > 0 else ocp_nodes_generated }}"
+
+ocp_masters: "{{ ocp_nodes | selectattr('role', 'equalto', 'master') | list }}"
+ocp_workers: "{{ ocp_nodes | selectattr('role', 'equalto', 'worker') | list }}"
+ocp_is_sno: "{{ (ocp_masters | length) == 1 and (ocp_workers | length) == 0 }}"
+rendezvous_ip: "{{ ocp_masters[0].ip }}"
+
+agent_iso_name: "agent-{{ cluster_name }}-{{ ocp_release }}.{{ ocp_arch }}.iso"
+
+# Used via module_defaults (group/community.proxmox.proxmox) in the playbooks
+proxmox_auth:
+  api_host: "{{ proxmox_api_host }}"
+  api_port: "{{ proxmox_api_port }}"
+  api_user: "{{ proxmox_api_user }}"
+  api_token_id: "{{ proxmox_api_token_id }}"
+  api_token_secret: "{{ proxmox_api_token_secret }}"
+  validate_certs: "{{ proxmox_validate_certs }}"
+
+# --- Autoscale spare pool (autoscale.yml) -------------------------------------
+# Spare VMs continue the IP/MAC numbering after the last installed node.
+autoscale_pool_size: "{{ [(autoscale_max_workers | int) - (ocp_workers | length), 0] | max }}"
+autoscale_pool: >-
+  {%- set ns = namespace(out=[]) -%}
+  {%- set o = ip_start.split('.') | map('int') | list -%}
+  {%- set base = o[0] * 16777216 + o[1] * 65536 + o[2] * 256 + o[3] + (ocp_nodes | length) -%}
+  {%- for i in range(autoscale_pool_size | int) -%}
+    {%- set n = base + i -%}
+    {%- set b = [(n // 16777216) % 256, (n // 65536) % 256, (n // 256) % 256, n % 256] -%}
+    {%- set ns.out = ns.out + [{
+          'name': autoscale_name_prefix ~ '-' ~ i,
+          'vm_name': autoscale_name_prefix ~ '-' ~ i ~ '.' ~ cluster_name,
+          'pve_node': autoscale_proxmox_nodes[i % (autoscale_proxmox_nodes | length)],
+          'ip': b | join('.'),
+          'mac': '52:54:00:%02x:%02x:%02x' | format(b[1], b[2], b[3]),
+        } | combine(autoscale_worker_size)] -%}
+  {%- endfor -%}
+  {{ ns.out }}
+# Only VMs matching this are visible to the Redfish emulator
+autoscale_vm_name_regex: '^{{ autoscale_name_prefix }}-[0-9]+\.{{ cluster_name | regex_escape }}$'
+helm_bin: "{{ ocp_state_dir }}/bin/helm-{{ helm_version }}/helm"

@@ -1,0 +1,74 @@
+# Spare worker VMs on Proxmox, managed by kubemox. They are created stopped-ish
+# (kubemox starts a new VM once; Ironic powers it off on registration) and
+# kubemox never powers them on again (enableAutoStart: false): from then on
+# Metal3/Ironic owns power and boot order through the Redfish emulator.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ autoscale_pool_namespace }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: proxmox-token
+  namespace: {{ autoscale_pool_namespace }}
+type: Opaque
+stringData:
+  secret: {{ autoscale_proxmox_token_secret | to_json }}
+---
+apiVersion: proxmox.alperen.cloud/v1alpha1
+kind: ProxmoxConnection
+metadata:
+  name: {{ cluster_name }}-proxmox
+spec:
+  endpoint: "https://{{ autoscale_proxmox_api_host }}:{{ proxmox_api_port }}/api2/json"
+  tokenID: "{{ autoscale_proxmox_token_user }}!{{ autoscale_proxmox_token_id }}"
+  secretFrom:
+    name: proxmox-token
+    namespace: {{ autoscale_pool_namespace }}
+    key: secret
+  insecureSkipVerify: {{ (not (autoscale_proxmox_validate_certs | bool)) | to_json }}
+{% for h in autoscale_pool %}
+---
+apiVersion: proxmox.alperen.cloud/v1alpha1
+kind: VirtualMachine
+metadata:
+  name: {{ h.name }}
+  namespace: {{ autoscale_pool_namespace }}
+  labels:
+    openshift5/cluster: {{ cluster_name }}
+    openshift5/role: autoscale-worker
+spec:
+  name: {{ h.vm_name }}
+  nodeName: {{ h.pve_node }}
+  connectionRef:
+    name: {{ cluster_name }}-proxmox
+  enableAutoStart: false
+  deletionProtection: false
+  vmSpec:
+    socket: 1
+    cores: {{ h.cores }}
+    memory: {{ h.memory }}
+    disk:
+      - storage: {{ proxmox_disk_storage }}
+        size: {{ h.disk_gb }}
+        device: scsi0
+    network:
+      - model: virtio
+        bridge: {{ proxmox_bridge }}
+    osImage:
+      name: ide2
+      value: none
+  # Applied on every reconcile - only static settings here. Never put "boot"
+  # or "ide2" in it: Ironic changes those while provisioning.
+  additionalConfig:
+    ostype: l26
+    bios: ovmf
+    machine: q35
+    cpu: host
+    numa: "1"
+    balloon: "0"
+    scsihw: virtio-scsi-single
+    net0: "virtio={{ h.mac }},bridge={{ proxmox_bridge }}{{ (',tag=' ~ proxmox_vlan) if proxmox_vlan | string | length > 0 else '' }}"
+    tags: "openshift;{{ cluster_name }};autoscale"
+{% endfor %}

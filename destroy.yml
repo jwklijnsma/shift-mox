@@ -1,0 +1,79 @@
+---
+# Removes the VMs and the ISO, and the local build state.
+#   ansible-playbook destroy.yml --ask-vault-pass -e confirm_destroy=ocp5
+- name: Destroy OpenShift cluster on Proxmox VE
+  hosts: localhost
+  gather_facts: false
+  module_defaults:
+    group/community.proxmox.proxmox: "{{ proxmox_auth }}"
+
+  tasks:
+    - name: Require the cluster name as confirmation
+      ansible.builtin.assert:
+        that: confirm_destroy | default('') == cluster_name
+        fail_msg: "Re-run with -e confirm_destroy={{ cluster_name }} to delete VMs {{ ocp_nodes | map(attribute='vmid') | join(', ') }}."
+
+    - name: Stop VMs
+      community.proxmox.proxmox_kvm:
+        node: "{{ item.pve_node }}"
+        vmid: "{{ item.vmid }}"
+        state: stopped
+        force: true
+      loop: "{{ ocp_nodes }}"
+      loop_control:
+        label: "{{ item.name }}"
+      failed_when: false
+
+    - name: Delete VMs (disks included)
+      community.proxmox.proxmox_kvm:
+        node: "{{ item.pve_node }}"
+        vmid: "{{ item.vmid }}"
+        state: absent
+      loop: "{{ ocp_nodes }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    # Spare autoscale VMs were created by kubemox with VMIDs it picked itself,
+    # so find them by name.
+    - name: Find autoscale spare VMs
+      ansible.builtin.uri:
+        url: "https://{{ proxmox_api_host }}:{{ proxmox_api_port }}/api2/json/cluster/resources?type=vm"
+        headers:
+          Authorization: "PVEAPIToken={{ proxmox_api_user }}!{{ proxmox_api_token_id }}={{ proxmox_api_token_secret }}"
+        validate_certs: "{{ proxmox_validate_certs }}"
+      register: destroy_vms
+      no_log: true
+
+    - name: Stop and delete autoscale spare VMs
+      community.proxmox.proxmox_kvm:
+        node: "{{ item.node }}"
+        vmid: "{{ item.vmid }}"
+        state: absent
+        force: true
+      loop: "{{ destroy_vms.json.data | selectattr('name', 'defined') | selectattr('name', 'match', autoscale_vm_name_regex) | list }}"
+      loop_control:
+        label: "{{ item.name }} ({{ item.vmid }})"
+
+    - name: Delete virtual-media ISOs left by the Redfish emulator
+      community.proxmox.proxmox_template:
+        node: "{{ item.node }}"
+        storage: "{{ proxmox_iso_storage }}"
+        content_type: iso
+        template: "redfish-vmedia-{{ item.vmid }}.iso"
+        state: absent
+      loop: "{{ destroy_vms.json.data | selectattr('name', 'defined') | selectattr('name', 'match', autoscale_vm_name_regex) | list }}"
+      loop_control:
+        label: "{{ item.vmid }}"
+
+    - name: Delete agent ISO from Proxmox
+      community.proxmox.proxmox_template:
+        node: "{{ proxmox_iso_node }}"
+        storage: "{{ proxmox_iso_storage }}"
+        content_type: iso
+        template: "{{ agent_iso_name }}"
+        state: absent
+
+    - name: Remove local build state
+      ansible.builtin.file:
+        path: "{{ work_dir }}"
+        state: absent

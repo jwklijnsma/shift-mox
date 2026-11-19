@@ -1,0 +1,197 @@
+---
+# Full deploy:  ansible-playbook site.yml --ask-vault-pass
+# Only a stage: ansible-playbook site.yml --tags iso,vms
+- name: Deploy OpenShift on Proxmox VE (agent-based installer)
+  hosts: localhost
+  gather_facts: false
+  module_defaults:
+    group/community.proxmox.proxmox: "{{ proxmox_auth }}"
+  # openshift-install calls `oc` itself (to extract the base ISO from the
+  # release payload), so the downloaded client tools must be on the PATH.
+  environment:
+    PATH: "{{ ocp_bin_dir }}:{{ lookup('ansible.builtin.env', 'PATH') }}"
+
+  pre_tasks:
+    # --- Proxmox API token: checked first, before anything slow happens ------
+    - name: Proxmox API preflight (token and permissions)
+      tags: [always]
+      ansible.builtin.uri:
+        url: "https://{{ proxmox_api_host }}:{{ proxmox_api_port }}/api2/json/access/permissions?path={{ item.path | urlencode }}"
+        headers:
+          Authorization: "PVEAPIToken={{ proxmox_api_user }}!{{ proxmox_api_token_id }}={{ proxmox_api_token_secret }}"
+        validate_certs: "{{ proxmox_validate_certs }}"
+        status_code: [200, 401, 403]
+        timeout: 15
+      register: _pve
+      no_log: true          # the request carries the token secret
+      failed_when: false
+      loop:
+        - { path: "/storage/{{ proxmox_iso_storage }}", privs: [Datastore.AllocateTemplate, Datastore.Audit] }
+        - { path: "/storage/{{ proxmox_disk_storage }}", privs: [Datastore.AllocateSpace] }
+        - path: /vms
+          privs: [VM.Allocate, VM.Config.Disk, VM.Config.CDROM, VM.Config.CPU, VM.Config.Memory,
+                  VM.Config.Network, VM.Config.Options, VM.Config.HWType, VM.PowerMgmt]
+        - { path: "/sdn/zones/localnetwork/{{ proxmox_bridge }}", privs: [SDN.Use] }
+
+    - name: Fail on Proxmox API problems
+      tags: [always]
+      ansible.builtin.assert:
+        that:
+          - r.status | default(-1) == 200
+          - _missing | length == 0
+        fail_msg: "{{ _msg }}"
+        quiet: true
+      vars:
+        _token: "{{ proxmox_api_user }}!{{ proxmox_api_token_id }}"
+        _have: "{{ (r.json.data | default({}))[r.item.path] | default({}) }}"
+        _missing: "{{ r.item.privs | reject('in', _have) | list }}"
+        _st: "{{ r.status | default(-1) }}"
+        _m401: >-
+          Proxmox rejected token {{ _token }} (401): the token does not exist or the secret
+          in group_vars/all/vault.yml is wrong. On the Proxmox node, run `./ocp.sh token`
+          to create a fresh one automatically.
+        _mdown: "Cannot reach the Proxmox API at {{ proxmox_api_host }}:{{ proxmox_api_port }}: {{ r.msg | default('') }}"
+        _mhttp: "Proxmox API returned HTTP {{ _st }} for {{ r.item.path }}."
+        _mpriv: >-
+          Token {{ _token }} is missing {{ _missing | join(', ') }} on {{ r.item.path }}.
+          On the Proxmox node, `./ocp.sh token` sets the right permissions
+          (PVEVMAdmin, PVEDatastoreAdmin, PVESDNUser on /, privsep off).
+        _msg: >-
+          {{ _m401 if _st | int == 401
+             else _mdown if _st | int in [-1, 0]
+             else _mhttp if _st | int != 200
+             else _mpriv }}
+      loop: "{{ _pve.results }}"
+      loop_control:
+        loop_var: r
+        label: "{{ r.item.path }}"
+
+    - name: Get the Proxmox cluster node list
+      tags: [always]
+      ansible.builtin.uri:
+        url: "https://{{ proxmox_api_host }}:{{ proxmox_api_port }}/api2/json/nodes"
+        headers:
+          Authorization: "PVEAPIToken={{ proxmox_api_user }}!{{ proxmox_api_token_id }}={{ proxmox_api_token_secret }}"
+        validate_certs: "{{ proxmox_validate_certs }}"
+        timeout: 15
+      register: _pve_nodes
+      no_log: true
+
+    - name: Node names in cluster.yml must exist in Proxmox and be online
+      tags: [always]
+      ansible.builtin.assert:
+        that:
+          - _unknown | length == 0
+          - _offline | length == 0
+          - _iso_local_ok
+        fail_msg: >-
+          {{ ('Unknown Proxmox node(s): ' ~ (_unknown | join(', ')) ~ '. This cluster has: '
+              ~ (_known | join(', ')) ~ '. Fix proxmox_nodes / proxmox_iso_node in cluster.yml. ')
+             if _unknown | length > 0 else '' }}{{
+             ('Offline node(s): ' ~ (_offline | join(', ')) ~ '. ') if _offline | length > 0 else '' }}{{
+             ('ISO storage "' ~ proxmox_iso_storage ~ '" is local to ' ~ proxmox_iso_node
+              ~ ' but VMs go to ' ~ (_vm_nodes | join(', ')) ~ '. Use shared ISO storage or the same node.')
+             if not _iso_local_ok else '' }}
+        quiet: true
+      vars:
+        _known: "{{ _pve_nodes.json.data | map(attribute='node') | list }}"
+        _online: "{{ _pve_nodes.json.data | selectattr('status', 'equalto', 'online') | map(attribute='node') | list }}"
+        _vm_nodes: "{{ ocp_nodes | map(attribute='pve_node') | unique | list }}"
+        _wanted: "{{ [proxmox_iso_node] | union(_vm_nodes) | list }}"
+        _unknown: "{{ _wanted | reject('in', _known) | list }}"
+        _offline: "{{ _wanted | select('in', _known) | reject('in', _online) | list }}"
+        # "local" is per node; any other storage name is assumed to be shared
+        _iso_local_ok: "{{ proxmox_iso_storage != 'local' or _vm_nodes == [proxmox_iso_node] }}"
+
+    - name: DNS preflight (api, api-int, *.apps must resolve)
+      tags: [always]
+      # With dns_check_server set, ask that server directly (dig never appends
+      # a search domain); otherwise use the system resolver.
+      ansible.builtin.command:
+        argv: >-
+          {{ ['dig', '+short', '+time=3', '+tries=2', '@' ~ dns_check_server, item.name, 'A']
+             if dns_check_server | default('') | length > 0
+             else ['getent', 'hosts', item.name] }}
+      register: _dns
+      changed_when: false
+      failed_when: false
+      loop:
+        - { name: "api.{{ cluster_name }}.{{ base_domain }}", want: "{{ api_vip if not ocp_is_sno else rendezvous_ip }}" }
+        - { name: "api-int.{{ cluster_name }}.{{ base_domain }}", want: "{{ api_vip if not ocp_is_sno else rendezvous_ip }}" }
+        - { name: "test.apps.{{ cluster_name }}.{{ base_domain }}", want: "{{ ingress_vip if not ocp_is_sno else rendezvous_ip }}" }
+      loop_control:
+        label: "{{ item.name }} -> {{ item.want }}"
+
+    - name: Fail on missing or wrong DNS records
+      tags: [always]
+      ansible.builtin.assert:
+        that:
+          - _got_name | lower == r.item.name | lower
+          - _got_ip == r.item.want
+        fail_msg: "{{ _problem }} (Set skip_dns_check=true to ignore.)"
+        quiet: true
+      vars:
+        _server: "{{ dns_check_server | default('') }}"
+        _got_ip: >-
+          {{ (r.stdout_lines | default([]) | select('match', '^[0-9.]+$') | list | last | default(''))
+             if _server | length > 0 else (r.stdout.split() | first | default('')) }}
+        _got_name: "{{ r.item.name if _server | length > 0 else (r.stdout.split()[1] | default('')) }}"
+        _where: "{{ ' on DNS server ' ~ _server if _server | length > 0 else '' }}"
+        _missing: >-
+          {{ 'dig is not installed (apt install bind9-dnsutils).' if 'No such file' in (r.msg | default(''))
+             else 'DNS server ' ~ _server ~ ' did not answer: ' ~ r.stdout if (_server | length > 0 and r.rc != 0)
+             else r.item.name ~ ' does not resolve' ~ _where ~ '. Create an A record pointing to ' ~ r.item.want ~ '.' }}
+        _search: >-
+          {{ r.item.name }} does not exist in DNS. Your resolver appended a search domain and matched
+          {{ _got_name }} ({{ _got_ip }}) instead - probably a wildcard record.
+          Create an A record for {{ r.item.name }} pointing to {{ r.item.want }}.
+        _wrong: "{{ r.item.name }} resolves to {{ _got_ip }}{{ _where }}, but should point to {{ r.item.want }}."
+        _problem: >-
+          {{ _missing if (r.rc != 0 or _got_ip == '')
+             else _search if (_got_name | lower != r.item.name | lower)
+             else _wrong }}
+      loop: "{{ _dns.results }}"
+      loop_control:
+        loop_var: r
+        label: "{{ r.item.name }}"
+      when: not (skip_dns_check | default(false) | bool)
+
+    # The installer refuses to start when <anything>.<cluster>.<base_domain>
+    # resolves (validation dns-wildcard-not-configured) and then just sits in
+    # "insufficient" until the bootstrap wait times out after ~1 hour.
+    - name: DNS preflight (no wildcard on the cluster domain)
+      tags: [always]
+      ansible.builtin.command:
+        argv: ['dig', '+short', '+time=3', '+tries=2', '@{{ item }}', 'validateNoWildcardDNS.{{ cluster_name }}.{{ base_domain }}', 'A']
+      register: _wild
+      changed_when: false
+      failed_when: false
+      loop: "{{ (dns_servers + ([dns_check_server] if dns_check_server | default('') | length > 0 else [])) | unique }}"
+      when: not (skip_dns_check | default(false) | bool)
+
+    - name: Fail on a wildcard DNS record for the cluster domain
+      tags: [always]
+      ansible.builtin.assert:
+        that: _ips | length == 0
+        fail_msg: >-
+          DNS server {{ r.item }} answers validateNoWildcardDNS.{{ cluster_name }}.{{ base_domain }}
+          with {{ _ips | join(', ') }}: there is a wildcard record (*.{{ cluster_name }}.{{ base_domain }}
+          or a parent like *.{{ base_domain }}). The installer refuses to start while it exists.
+          Remove that wildcard, or make your DNS server authoritative for {{ cluster_name }}.{{ base_domain }}
+          with only api, api-int, *.apps (and node records), so other names return NXDOMAIN.
+          *.apps.{{ cluster_name }}.{{ base_domain }} itself is fine. (skip_dns_check=true to ignore.)
+        quiet: true
+      vars:
+        _ips: "{{ r.stdout_lines | default([]) | select('match', '^[0-9a-fA-F.:]+$') | list }}"
+      loop: "{{ _wild.results | default([]) | reject('skipped') }}"
+      loop_control:
+        loop_var: r
+        label: "{{ r.item }}"
+      when: not (skip_dns_check | default(false) | bool)
+
+  roles:
+    - { role: tools, tags: [tools] }
+    - { role: agent_iso, tags: [iso] }
+    - { role: proxmox_iso, tags: [iso, upload] }
+    - { role: proxmox_vms, tags: [vms] }
+    - { role: wait_install, tags: [wait] }

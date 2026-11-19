@@ -1,0 +1,59 @@
+---
+# Calico Open Source for OpenShift, installed at cluster-install time.
+# The agent installer applies every manifest in <install dir>/openshift/ while
+# bootstrapping, so Calico's Tigera operator is running before the nodes need a
+# CNI. install-config.yaml already says networkType: Calico.
+
+- name: Create the Calico download dir and the agent manifests dir
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0750"
+  loop:
+    - "{{ ocp_state_dir }}/calico/{{ calico_version }}"
+    - "{{ work_dir }}/build/openshift"
+
+- name: Download the Calico OpenShift manifest bundle
+  ansible.builtin.get_url:
+    url: "https://github.com/projectcalico/calico/releases/download/v{{ calico_version }}/ocp.tgz"
+    dest: "{{ ocp_state_dir }}/calico/ocp-{{ calico_version }}.tgz"
+    mode: "0640"
+
+- name: Unpack the bundle
+  ansible.builtin.unarchive:
+    src: "{{ ocp_state_dir }}/calico/ocp-{{ calico_version }}.tgz"
+    dest: "{{ ocp_state_dir }}/calico/{{ calico_version }}"
+    remote_src: true
+    extra_opts: ["--strip-components=1"]
+    creates: "{{ ocp_state_dir }}/calico/{{ calico_version }}/02-tigera-operator.yaml"
+
+- name: Copy the bundle into the install dir (openshift/)
+  ansible.builtin.copy:
+    src: "{{ ocp_state_dir }}/calico/{{ calico_version }}/"
+    dest: "{{ work_dir }}/build/openshift/"
+    remote_src: true
+    mode: "0600"
+
+- name: Render the Calico Installation resource (IP pool follows cluster_network)
+  ansible.builtin.template:
+    src: calico-installation.yaml.j2
+    dest: "{{ work_dir }}/build/openshift/03-cr-installation.yaml"
+    mode: "0600"
+
+# Iptables keeps kube-proxy (the bundle's Network CR turns it off for BPF) and
+# needs no API endpoint override.
+- name: Drop the files only the BPF dataplane needs
+  ansible.builtin.file:
+    path: "{{ work_dir }}/build/openshift/{{ item }}"
+    state: absent
+  loop:
+    - cluster-network-operator.yaml
+    - 01-configmap-kubernetes-services-endpoint.yaml
+  when: calico_dataplane == 'Iptables'
+
+- name: Point the BPF dataplane at the API server
+  ansible.builtin.replace:
+    path: "{{ work_dir }}/build/openshift/01-configmap-kubernetes-services-endpoint.yaml"
+    regexp: 'KUBERNETES_SERVICE_HOST: ".*"'
+    replace: 'KUBERNETES_SERVICE_HOST: "api.{{ cluster_name }}.{{ base_domain }}"'
+  when: calico_dataplane == 'BPF'

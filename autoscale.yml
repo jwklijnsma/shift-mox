@@ -1,0 +1,53 @@
+---
+# Worker autoscaling on Proxmox VE, run after the cluster is installed:
+#   ansible-playbook autoscale.yml --ask-vault-pass
+#
+# 1. proxmox-redfish  Redfish BMC emulator (sushy-tools + Proxmox driver) as a
+#                     systemd service on the runner LXC
+#                     on_demand: it also creates a worker VM when OpenShift
+#                     provisions one and deletes it after scale-down
+# 2. ocp_autoscale    BareMetalHosts pointing at the emulator (kubemox mode:
+#                     kubemox operator + pre-created VMs),
+#                     ClusterAutoscaler + MachineAutoscaler on the worker MachineSet
+#
+# Afterwards scale from the console (Compute > MachineSets > Edit Machine count)
+# or let the ClusterAutoscaler do it when pods are Pending.
+# Settings: group_vars/all/autoscale.yml
+
+- name: Cluster token for the Redfish BMC (on-demand VMs)
+  hosts: localhost
+  gather_facts: false
+  tags: [bmc, cluster]
+  environment:
+    PATH: "{{ ocp_bin_dir }}:{{ lookup('ansible.builtin.env', 'PATH') }}"
+    KUBECONFIG: "{{ work_dir }}/kubeconfig"
+  tasks:
+    - name: Tools (oc)
+      ansible.builtin.include_role:
+        name: tools
+      when: autoscale_vm_provisioning == 'on_demand'
+    - name: Read-only token for listing BareMetalHosts
+      ansible.builtin.include_role:
+        name: ocp_autoscale
+        tasks_from: bmc_token.yml
+      when: autoscale_vm_provisioning == 'on_demand'
+
+- name: Redfish BMC emulator for Proxmox VMs
+  # Override with -e redfish_bmc_hosts=<group or host> (play hosts can't come from group_vars)
+  hosts: "{{ redfish_bmc_hosts | default('runner') }}"
+  gather_facts: true
+  become: true
+  tags: [bmc]
+  roles:
+    - proxmox_redfish
+
+- name: Worker slots, Metal3 hosts and autoscaler
+  hosts: localhost
+  gather_facts: false
+  tags: [cluster]
+  environment:
+    PATH: "{{ ocp_bin_dir }}:{{ lookup('ansible.builtin.env', 'PATH') }}"
+    KUBECONFIG: "{{ work_dir }}/kubeconfig"
+  roles:
+    - { role: tools, tags: [tools] }
+    - ocp_autoscale

@@ -1,0 +1,57 @@
+---
+- name: Create bin and work directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0750"
+  loop:
+    - "{{ ocp_bin_dir }}"
+    - "{{ work_dir }}"
+
+- name: Download and verify client tarballs
+  ansible.builtin.get_url:
+    url: "{{ ocp_download_base }}/{{ item }}"
+    dest: "{{ ocp_bin_dir }}/{{ item }}"
+    checksum: "sha256:{{ ocp_download_base }}/sha256sum.txt"
+    mode: "0640"
+  loop: "{{ ocp_tool_tarballs }}"
+
+- name: Unpack openshift-install, oc and kubectl
+  ansible.builtin.unarchive:
+    src: "{{ ocp_bin_dir }}/{{ item }}"
+    dest: "{{ ocp_bin_dir }}"
+    creates: "{{ ocp_bin_dir }}/{{ 'openshift-install' if 'install' in item else 'oc' }}"
+  loop: "{{ ocp_tool_tarballs }}"
+
+- name: Point bin/current at this release (used by ocp.sh status)
+  ansible.builtin.file:
+    src: "{{ ocp_release }}"
+    dest: "{{ ocp_state_dir }}/bin/current"
+    state: link
+    force: true
+
+- name: Check installer reports the expected version
+  ansible.builtin.command: "{{ ocp_install_bin }} version"
+  register: tools_installer_version
+  changed_when: false
+  failed_when: ocp_release not in tools_installer_version.stdout
+
+- name: Check oc runs (openshift-install calls it to extract the base ISO)
+  ansible.builtin.command: "{{ oc_bin }} version --client"
+  register: tools_oc_version
+  changed_when: false
+  failed_when: false
+
+- name: Fail if oc is missing or broken
+  ansible.builtin.assert:
+    that: tools_oc_version.rc == 0
+    fail_msg: >-
+      {{ oc_bin }} does not run: {{ tools_oc_version.msg | default('') }} {{ tools_oc_version.stderr | default('') }}.
+      Delete {{ ocp_bin_dir }} and re-run to download the client again.
+    quiet: true
+
+- name: Agent installer needs nmstatectl on the controller for static networking
+  ansible.builtin.command: nmstatectl --version
+  changed_when: false
+  register: tools_nmstate
+  failed_when: tools_nmstate.rc != 0

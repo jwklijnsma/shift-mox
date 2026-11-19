@@ -1,0 +1,41 @@
+apiVersion: v1beta1
+kind: AgentConfig
+metadata:
+  name: {{ cluster_name }}
+rendezvousIP: {{ rendezvous_ip }}
+hosts:
+{% for n in ocp_nodes %}
+  - hostname: {{ n.name }}
+    role: {{ n.role }}
+    rootDeviceHints:
+      deviceName: /dev/sda
+    interfaces:
+      - name: {{ node_interface }}
+        macAddress: "{{ n.mac }}"
+    networkConfig:
+      interfaces:
+        - name: {{ node_interface }}
+          type: ethernet
+          state: up
+          mac-address: "{{ n.mac }}"
+          ipv4:
+            enabled: true
+            dhcp: false
+            address:
+              - ip: {{ n.ip }}
+                prefix-length: {{ prefix_length }}
+          ipv6:
+            enabled: false
+      dns-resolver:
+        config:
+          server:
+{% for d in dns_servers %}
+            - {{ d }}
+{% endfor %}
+      routes:
+        config:
+          - destination: 0.0.0.0/0
+            next-hop-address: {{ gateway }}
+            next-hop-interface: {{ node_interface }}
+            table-id: 254
+{% endfor %}

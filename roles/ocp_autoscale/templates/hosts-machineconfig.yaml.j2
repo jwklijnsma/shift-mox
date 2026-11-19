@@ -1,0 +1,49 @@
+{# /etc/hosts entries for every node + spare worker, and the hostname for new
+   autoscale workers (by MAC). Replaces the need for PTR records. #}
+{%- set ns = namespace(lines=['# ip fqdn name [mac] - managed by openshift5 autoscale.yml']) -%}
+{%- for n in ocp_nodes + autoscale_pool -%}
+{%-   set ns.lines = ns.lines + [[n.ip, n.name ~ '.' ~ cluster_name ~ '.' ~ base_domain, n.name, n.mac | default('')] | join(' ') | trim] -%}
+{%- endfor -%}
+{%- set mapping = (ns.lines | join('\n')) ~ '\n' -%}
+apiVersion: machineconfiguration.openshift.io/v1
+kind: MachineConfig
+metadata:
+  name: 99-worker-openshift5-hosts
+  labels:
+    machineconfiguration.openshift.io/role: worker
+spec:
+  config:
+    ignition:
+      version: 3.2.0
+    storage:
+      files:
+        - path: /etc/autoscale-hosts
+          mode: 420
+          overwrite: true
+          contents:
+            source: "data:text/plain;charset=utf-8;base64,{{ mapping | b64encode }}"
+        - path: /usr/local/bin/autoscale-hosts.sh
+          mode: 493
+          overwrite: true
+          contents:
+            source: "data:text/plain;charset=utf-8;base64,{{ lookup('ansible.builtin.file', 'autoscale-hosts.sh') | b64encode }}"
+    systemd:
+      units:
+        - name: autoscale-hosts.service
+          enabled: true
+          contents: |
+            [Unit]
+            Description=openshift5: /etc/hosts entries and hostname for autoscaled workers
+            DefaultDependencies=no
+            After=local-fs.target
+            Before=NetworkManager.service network-pre.target node-valid-hostname.service
+            Wants=network-pre.target
+            ConditionPathExists=/etc/autoscale-hosts
+
+            [Service]
+            Type=oneshot
+            RemainAfterExit=yes
+            ExecStart=/bin/bash /usr/local/bin/autoscale-hosts.sh
+
+            [Install]
+            WantedBy=multi-user.target

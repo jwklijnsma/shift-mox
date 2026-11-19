@@ -1,0 +1,28 @@
+# Managed by Ansible (roles/proxmox_redfish) - sushy-emulator config, Python syntax
+# LISTEN/SSL are only used by the Flask development server (manual runs);
+# the service runs under gunicorn, which gets them on its command line.
+SUSHY_EMULATOR_LISTEN_IP = "{{ redfish_bmc_address }}"
+SUSHY_EMULATOR_LISTEN_PORT = {{ redfish_bmc_port | int }}
+SUSHY_EMULATOR_SSL_CERT = "{{ proxmox_redfish_conf_dir }}/tls.crt"
+SUSHY_EMULATOR_SSL_KEY = "{{ proxmox_redfish_conf_dir }}/tls.key"
+SUSHY_EMULATOR_AUTH_FILE = "{{ proxmox_redfish_conf_dir }}/htpasswd"
+SUSHY_EMULATOR_FEATURE_SET = "vmedia"
+SUSHY_EMULATOR_VMEDIA_DEVICES = {"Cd": {"Name": "Virtual CD", "MediaTypes": ["CD", "DVD"]}}
+SUSHY_EMULATOR_IGNORE_BOOT_DEVICE = False
+
+SUSHY_PROXMOX_HOST = {{ proxmox_api_host | to_json }}
+SUSHY_PROXMOX_PORT = {{ proxmox_api_port | int }}
+SUSHY_PROXMOX_TOKEN_USER = {{ autoscale_proxmox_token_user | to_json }}
+SUSHY_PROXMOX_TOKEN_NAME = {{ autoscale_proxmox_token_id | to_json }}
+SUSHY_PROXMOX_TOKEN_SECRET = {{ autoscale_proxmox_token_secret | to_json }}
+SUSHY_PROXMOX_VERIFY_SSL = {{ proxmox_validate_certs | bool }}
+SUSHY_PROXMOX_ISO_STORAGE = {{ proxmox_iso_storage | to_json }}
+SUSHY_PROXMOX_NAME_REGEX = r"{{ autoscale_vm_name_regex }}"
+
+# On-demand worker VMs: slots + reaper (empty when autoscale_vm_provisioning is kubemox)
+import json as _json
+SUSHY_PROXMOX_SLOTS = _json.loads({{ (proxmox_redfish_slots | to_json) | to_json }})
+SUSHY_PROXMOX_DELETE_GRACE = {{ autoscale_vm_delete_grace | int }}
+SUSHY_K8S_API = "https://{{ api_vip }}:6443"
+SUSHY_K8S_TOKEN = {{ proxmox_redfish_k8s_token | to_json }}
+SUSHY_K8S_NAMESPACE = "openshift-machine-api"

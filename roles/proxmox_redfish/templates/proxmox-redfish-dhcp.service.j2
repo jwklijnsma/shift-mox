@@ -1,0 +1,14 @@
+[Unit]
+Description=DHCP for OpenShift autoscale worker slots (static leases only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+RuntimeDirectory=proxmox-redfish-dhcp
+ExecStartPre={{ proxmox_redfish_dnsmasq }} --test --conf-file={{ proxmox_redfish_conf_dir }}/dhcp.conf
+ExecStart={{ proxmox_redfish_dnsmasq }} --keep-in-foreground --conf-file={{ proxmox_redfish_conf_dir }}/dhcp.conf --user=nobody --group={{ 'nogroup' if ansible_os_family == 'Debian' else 'nobody' }}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

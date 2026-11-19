@@ -1,0 +1,11 @@
+[Unit]
+Description=Record serial consoles of OpenShift autoscale worker VMs
+After=pve-guests.service
+
+[Service]
+ExecStart=/usr/local/sbin/proxmox-redfish-console.sh '{{ autoscale_vm_name_regex }}'
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

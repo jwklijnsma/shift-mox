@@ -1,0 +1,103 @@
+---
+# =============================================================================
+# The whole cluster is described here. Change this file, commit, re-run.
+# =============================================================================
+
+# --- OpenShift / OKD ---------------------------------------------------------
+# ocp = Red Hat OpenShift (needs a pull secret / subscription)
+# okd = OKD, the community distribution on CentOS Stream CoreOS (SCOS):
+#       free, no pull secret, downloaded from github.com/okd-project/okd
+ocp_distribution: ocp
+ocp_version: "5.0.0"                 # OpenShift: any z-stream on the mirror, e.g. 5.0.2
+okd_version: "5.0.0-okd-scos.6"      # OKD: a release tag from github.com/okd-project/okd/releases
+ocp_arch: x86_64
+cluster_name: ocp5
+base_domain: lab.example.nl          # API = api.ocp5.lab.example.nl
+
+# Where the OpenShift client tools come from (OKD always uses GitHub releases).
+# Verify the path for your version on https://mirror.openshift.com/pub/.
+ocp_mirror_base: "https://mirror.openshift.com/pub/openshift-v5/{{ ocp_arch }}/clients/ocp/{{ ocp_version }}"
+
+# State dir on the controller/runner: downloaded tools, install state,
+# kubeconfig + kubeadmin password. The GitHub workflow points this outside
+# the checkout (/var/lib/ocp-deploy) so it survives between runs.
+ocp_state_dir: "{{ playbook_dir }}/.work"
+work_dir: "{{ ocp_state_dir }}/{{ cluster_name }}"
+
+# Pull secret from https://console.redhat.com/openshift/install/pull-secret
+# (OpenShift only - OKD uses a placeholder and ignores this file)
+pull_secret_file: "{{ playbook_dir }}/secrets/pull-secret.json"
+ssh_pubkey_file: "~/.ssh/id_ed25519.pub"
+
+# --- Network -----------------------------------------------------------------
+machine_network: 192.168.50.0/24
+gateway: 192.168.50.1
+dns_servers: [192.168.50.200]
+# DNS server the preflight check asks for api / api-int / *.apps.
+# Empty = use the resolver of the machine running Ansible.
+dns_check_server: 10.0.3.98
+prefix_length: 24
+api_vip: 192.168.50.10               # not used for SNO
+ingress_vip: 192.168.50.11           # not used for SNO
+cluster_network: 10.128.0.0/14
+service_network: 172.30.0.0/16
+
+# CNI (pod network). Calico Open Source is installed at install time: the
+# Tigera operator manifests are downloaded and handed to the agent installer.
+# Changing this (or the Calico settings below) needs a rebuilt ISO
+# (agent_iso_rebuild=true) and a fresh cluster - a running cluster can't be
+# switched by re-running this playbook.
+cni: Calico                          # Calico | OVNKubernetes
+calico_version: "3.33.0"             # release on github.com/projectcalico/calico/releases
+calico_dataplane: Iptables           # Iptables | BPF (BPF replaces kube-proxy)
+calico_encapsulation: VXLAN          # VXLAN | IPIP | None (None = routed, needs L2/BGP)
+# NIC name inside RHCOS for a virtio NIC on Proxmox
+node_interface: ens18
+
+# --- Proxmox -----------------------------------------------------------------
+proxmox_api_host: 10.0.3.21
+proxmox_api_port: 8006
+proxmox_api_user: ansible@pve
+proxmox_api_token_id: ocp
+# proxmox_api_token_secret  -> group_vars/all/vault.yml (ansible-vault)
+# The API is reachable from the internet, so the certificate is checked.
+# Give Proxmox a real cert (Datacenter > ACME, Let's Encrypt). Only set false
+# for a self-signed lab box that is NOT internet-facing.
+proxmox_validate_certs: false
+# Node that receives the ISO upload. Defaults to the first VM node; with
+# node-local ISO storage (like "local") it must be the node the VMs run on.
+proxmox_iso_node: "{{ proxmox_nodes[0] }}"
+proxmox_iso_storage: local           # must allow content "iso" (shared storage if VMs are spread over nodes)
+proxmox_disk_storage: local-zfs
+proxmox_bridge: vmbr1
+proxmox_vlan: ""                     # e.g. "50" for tagged
+
+# --- Nodes -------------------------------------------------------------------
+# 1 master            -> Single Node OpenShift (SNO)
+# 3 masters           -> compact cluster (masters also schedule workloads)
+# 3 masters + workers -> standard cluster
+#
+# The VMs are generated automatically from these settings:
+#   name     master-0.., worker-0..
+#   vmid     vmid_start + n         (masters first, then workers)
+#   ip       ip_start + n           (consecutive, inside machine_network)
+#   mac      52:54:00 + last 3 IP octets in hex  (stable, unique per IP)
+#   pve_node round-robin over proxmox_nodes, so masters land on different hosts
+ocp_master_count: 3
+ocp_worker_count: 2
+
+vmid_start: 5100
+ip_start: 192.168.50.21
+proxmox_nodes: [node02]               # e.g. [pve01, pve02, pve03] for HA placement
+
+master_size: { cores: 8, memory: 24576, disk_gb: 120 }
+worker_size: { cores: 8, memory: 16384, disk_gb: 120 }
+
+# Optional: override individual generated nodes by name, e.g.
+#   node_overrides:
+#     worker-1: { pve_node: pve02, memory: 32768 }
+node_overrides: {}
+
+# Optional: skip generation entirely and list nodes by hand (same fields as
+# the generated ones: name, role, vmid, pve_node, ip, mac, cores, memory, disk_gb).
+ocp_nodes_manual: []

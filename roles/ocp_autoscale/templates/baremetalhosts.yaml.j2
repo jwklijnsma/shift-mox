@@ -1,0 +1,99 @@
+# One BareMetalHost per worker slot. Network: with autoscale_dhcp (default)
+# the ramdisk and the installed node both use DHCP, answered with a static
+# lease per MAC by proxmox-redfish-dhcp. No copied static config that could
+# bind to a wrong interface name and leave the node without network.
+# online: false keeps it powered off and
+# "available" until the worker MachineSet claims it.
+{% for h in autoscale_pool %}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ h.name }}-bmc
+  namespace: openshift-machine-api
+type: Opaque
+stringData:
+  username: {{ redfish_bmc_user | to_json }}
+  password: {{ redfish_bmc_password | to_json }}
+{% if not (autoscale_dhcp | bool) %}
+---
+# Static IP for the IPA ramdisk and, copied by Metal3, for the installed node.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ h.name }}-network
+  namespace: openshift-machine-api
+type: Opaque
+stringData:
+  nmstate: |
+    interfaces:
+      - name: {{ node_interface }}
+        type: ethernet
+        state: up
+        mac-address: "{{ h.mac }}"
+        ipv4:
+          enabled: true
+          dhcp: false
+          address:
+            - ip: {{ h.ip }}
+              prefix-length: {{ prefix_length }}
+        ipv6:
+          enabled: false
+    dns-resolver:
+      config:
+        server:
+{% for d in dns_servers %}
+          - {{ d }}
+{% endfor %}
+    routes:
+      config:
+        - destination: 0.0.0.0/0
+          next-hop-address: {{ gateway }}
+          next-hop-interface: {{ node_interface }}
+          table-id: 254
+{% endif %}
+---
+apiVersion: metal3.io/v1alpha1
+kind: BareMetalHost
+metadata:
+  name: {{ h.name }}
+  namespace: openshift-machine-api
+  labels:
+    openshift5/cluster: {{ cluster_name }}
+    openshift5/role: autoscale-worker
+{% if autoscale_vm_provisioning == 'on_demand' %}
+  # No VM exists until the host is provisioned, so there is nothing to
+  # inspect: the hardware is described here instead.
+  annotations:
+    # both the annotation and (where the API has it) spec.inspectionMode:
+    # BMO versions differ in which one they honour
+    inspect.metal3.io: disabled
+    inspect.metal3.io/hardwaredetails: '{{ {
+        "systemVendor": {"manufacturer": "QEMU", "productName": "Standard PC (Q35 + ICH9, 2009)"},
+        "firmware": {"bios": {"vendor": "EDK II"}},
+        "cpu": {"arch": "x86_64", "model": "host", "count": h.cores | int},
+        "ramMebibytes": h.memory | int,
+        "nics": [{"name": node_interface, "mac": h.mac, "ip": h.ip, "speedGbps": 10}],
+        "storage": [{"name": "/dev/sda", "sizeBytes": (h.disk_gb | int) * 1073741824, "rotational": false, "type": "SSD"}],
+        "hostname": h.name } | to_json }}'
+{% endif %}
+spec:
+{% if autoscale_vm_provisioning == 'on_demand' and ocp_autoscale_inspmode.rc == 0 %}
+  inspectionMode: disabled
+{% endif %}
+  online: false
+  bootMode: UEFI
+  bootMACAddress: "{{ h.mac }}"
+  automatedCleaningMode: disabled
+  bmc:
+    address: "redfish-virtualmedia+https://{{ redfish_bmc_address }}:{{ redfish_bmc_port }}/redfish/v1/Systems/{{ h.vm_name }}"
+    credentialsName: {{ h.name }}-bmc
+    disableCertificateVerification: true
+{% if not (autoscale_dhcp | bool) %}
+  # Static config by name; only used without autoscale_dhcp. Note: it binds to
+  # node_interface by NAME, and on q35 VMs the NIC is usually not called ens18.
+  preprovisioningNetworkDataName: {{ h.name }}-network
+{% endif %}
+  rootDeviceHints:
+    deviceName: /dev/sda
+{% endfor %}

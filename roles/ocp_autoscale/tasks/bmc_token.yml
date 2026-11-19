@@ -1,0 +1,62 @@
+---
+# Read-only ServiceAccount token for the Redfish BMC's reaper: it lists
+# BareMetalHosts to see whether a scaled-down worker VM may be deleted.
+- name: ServiceAccount proxmox-redfish (list BareMetalHosts)
+  ansible.builtin.command:
+    argv: ["{{ oc_bin }}", apply, -f, "-"]
+    stdin: |
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: proxmox-redfish
+        namespace: openshift-machine-api
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: Role
+      metadata:
+        name: proxmox-redfish-read-bmh
+        namespace: openshift-machine-api
+      rules:
+        - apiGroups: [metal3.io]
+          resources: [baremetalhosts]
+          verbs: [get, list]
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: RoleBinding
+      metadata:
+        name: proxmox-redfish-read-bmh
+        namespace: openshift-machine-api
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: Role
+        name: proxmox-redfish-read-bmh
+      subjects:
+        - kind: ServiceAccount
+          name: proxmox-redfish
+          namespace: openshift-machine-api
+      ---
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: proxmox-redfish-token
+        namespace: openshift-machine-api
+        annotations:
+          kubernetes.io/service-account.name: proxmox-redfish
+      type: kubernetes.io/service-account-token
+  register: ocp_autoscale_sa_apply
+  changed_when: ocp_autoscale_sa_apply.stdout is search('created|configured')
+
+- name: Read the token
+  ansible.builtin.command:
+    argv: ["{{ oc_bin }}", -n, openshift-machine-api, get, secret, proxmox-redfish-token, -o, "jsonpath={.data.token}"]
+  register: ocp_autoscale_sa_token
+  changed_when: false
+  no_log: true
+  retries: 20
+  delay: 3
+  until: ocp_autoscale_sa_token.rc == 0 and ocp_autoscale_sa_token.stdout | length > 0
+
+- name: Keep it for the BMC play
+  ansible.builtin.set_fact:
+    ocp_autoscale_bmc_k8s_token: "{{ ocp_autoscale_sa_token.stdout | b64decode }}"
+  no_log: true

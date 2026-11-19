@@ -1,0 +1,15 @@
+# Calico install configuration for OpenShift (rendered by the agent_iso role).
+apiVersion: operator.tigera.io/v1
+kind: Installation
+metadata:
+  name: default
+spec:
+  variant: Calico
+  calicoNetwork:
+    linuxDataplane: {{ calico_dataplane }}
+    ipPools:
+      - cidr: {{ cluster_network }}
+        blockSize: 26
+        encapsulation: {{ calico_encapsulation }}
+        natOutgoing: Enabled
+        nodeSelector: all()
