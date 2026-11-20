@@ -54,6 +54,22 @@ every other check on the pull request has passed:
 - opt out per pull request with the `no-automerge` label, or by marking it as a draft;
 - when the update touched the docs site, the docs deploy is started afterwards.
 
-The pull requests themselves come from the
-[Renovate app](https://github.com/apps/renovate), which has to be enabled for
-the repository.
+### Renovate in GitHub Actions
+
+The pull requests come from Renovate, run by `renovate.yml` in this repository's
+own Actions every 4 hours (and from **Actions › renovate › Run workflow**). No
+Renovate app is needed. `renovate.json` sets what it updates: GitHub Actions
+(minor and patch bumps in one PR), the Ansible collections in `requirements.yml`
+and the docs site's `requirements-docs.txt`. A **Dependency Dashboard** issue lists
+everything Renovate knows about, including the majors it is waiting on.
+
+One-time setup: create a
+[fine-grained personal access token](https://github.com/settings/personal-access-tokens/new)
+for this repository only, with **Contents**, **Pull requests**, **Issues** and
+**Workflows** set to *Read and write*, and save it as the Actions secret
+`RENOVATE_TOKEN`. `GITHUB_TOKEN` can't be used: pull requests it opens start no
+checks, so they would never be merged automatically.
+
+The pull requests are opened under your account, on `renovate/…` branches;
+`automerge.yml` recognises them by that branch name, and merging one never starts
+a release on its own (the weekly release picks them up).
