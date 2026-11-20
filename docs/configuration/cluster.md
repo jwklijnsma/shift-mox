@@ -25,6 +25,17 @@ base_domain: lab.example.nl         # API = api.ocp5.lab.example.nl
 OKD tags ending in `.ec.N` are pre-releases. Switching distribution on an
 existing cluster isn't supported: `destroy.yml` first.
 
+## Install method
+
+```yaml
+install_method: agent               # agent | ipi | external
+```
+
+`agent` boots every VM from an agent ISO; `ipi` lets the installer power and
+install empty VMs through the Redfish BMC; `external` adds the Proxmox
+cloud-controller-manager. Their settings are in `group_vars/all/install.yml`.
+See [Install methods](../install/methods.md).
+
 ## Network
 
 | Variable | Example | Meaning |

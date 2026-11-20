@@ -9,6 +9,7 @@
 #   ./ocp.sh destroy           delete VMs, ISO and local state (asks for confirmation)
 #   ./ocp.sh autoscale         worker autoscaling: Redfish BMC, on-demand VMs,
 #                              Metal3 hosts, ClusterAutoscaler (after deploy)
+#   ./ocp.sh addons            Proxmox CSI driver (proxmox_csi_enabled) on a running cluster
 #   ./ocp.sh autoscale-debug   everything about autoscaling in one report
 #                              (MachineSets, Machines, hosts, nodes, CSRs,
 #                              autoscaler + machine controller logs, Redfish BMC)
@@ -43,7 +44,7 @@ warn() { printf '%s !  %s %s\n' "$c_warn" "$c_off" "$*" >&2; }
 die()  { printf '%s ✗ %s %s\n' "$c_err" "$c_off" "$*" >&2; exit 1; }
 trap 'die "failed at line $LINENO: $BASH_COMMAND"' ERR
 
-usage() { sed -n '3,24p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '3,25p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 is_pve_host() { command -v pveversion >/dev/null 2>&1; }
 
@@ -237,8 +238,9 @@ cmd_token() {
     ok "user $user created"
   fi
   # PVESDNUser: needed since PVE 8 to attach VMs/LXCs to a bridge
-  pveum acl modify / --users "$user" --roles PVEVMAdmin,PVEDatastoreAdmin,PVESDNUser
-  ok "permissions on / : PVEVMAdmin, PVEDatastoreAdmin, PVESDNUser"
+  # PVEAuditor (read-only, Sys.Audit): needed by the Proxmox CCM (install_method external)
+  pveum acl modify / --users "$user" --roles PVEVMAdmin,PVEDatastoreAdmin,PVESDNUser,PVEAuditor
+  ok "permissions on / : PVEVMAdmin, PVEDatastoreAdmin, PVESDNUser, PVEAuditor"
   pveum user token remove "$user" "$tid" >/dev/null 2>&1 || true
   secret="$(pveum user token add "$user" "$tid" --privsep 0 --comment "ocp.sh" --output-format json \
             | python3 -c 'import json,sys; print(json.load(sys.stdin)["value"])')"
@@ -262,6 +264,31 @@ bridge_ip() {  # IPv4 of this host on the cluster bridge (or its VLAN interface)
     [[ -n "$ip" ]] && { echo "$ip"; return 0; }
   done
   return 1
+}
+
+install_var() {  # read a plain value from group_vars/all/install.yml
+  sed -nE "s/^$1:[[:space:]]*\"?([^\"#]+)\"?.*/\1/p" group_vars/all/install.yml | head -1 | xargs
+}
+
+# On the Proxmox node, the Redfish BMC (ipi), the load balancer (external) and
+# the Proxmox API address for in-cluster clients (CCM, CSI) all use this
+# host's address on the cluster bridge - like `autoscale` does.
+# Sets HARGS (extra ansible-playbook arguments).
+HARGS=()
+host_role_args() {
+  local method csi ip
+  HARGS=()
+  method="$(cluster_var install_method)"; method="${method:-agent}"
+  csi="$(install_var proxmox_csi_enabled)"
+  is_pve_host || return 0
+  [[ "$method" == agent && "$csi" != true ]] && return 0
+  ip="$(bridge_ip)" || die "this host has no IPv4 address on bridge $(cluster_var proxmox_bridge).
+   install_method $method / the CSI driver need this host on the cluster network.
+   Give the bridge an IP in $(cluster_var machine_network), or run from the runner LXC."
+  [[ "$method" == external ]] && info "install_method external: api, api-int and *.apps must point to $ip (HAProxy on this host)"
+  HARGS=(-e redfish_bmc_hosts=localhost -e "redfish_bmc_address=$ip"
+         -e external_lb_hosts=localhost -e "external_lb_address=$ip"
+         -e "autoscale_proxmox_api_host=$ip" -e autoscale_proxmox_validate_certs=false)
 }
 
 autoscale_token() {  # dedicated token for kubemox + emulator -> secrets/autoscale.json
@@ -493,7 +520,7 @@ ORIG_ARGS=("$@")
 ACTION="" NO_TMUX=0 PUBLIC_API=0 REBUILD=0 NO_PULL=0
 while (($#)); do
   case "$1" in
-    deploy|wait|status|destroy|setup|token|autoscale|autoscale-debug) ACTION="$1" ;;
+    deploy|wait|status|destroy|setup|token|autoscale|autoscale-debug|addons) ACTION="$1" ;;
     --rebuild)    REBUILD=1 ;;
     --no-tmux)    NO_TMUX=1 ;;
     --public-api) PUBLIC_API=1 ;;
@@ -511,9 +538,15 @@ main() {
   case "$ACTION" in
     setup)   setup_tools; setup_secrets; ok "ready - run: $REPO_DIR/ocp.sh deploy" ;;
     deploy)  setup_tools; setup_secrets; in_tmux || true
-             playbook site.yml -e "agent_iso_rebuild=$([[ $REBUILD == 1 ]] && echo true || echo false)"
+             host_role_args
+             playbook site.yml -e "agent_iso_rebuild=$([[ $REBUILD == 1 ]] && echo true || echo false)" "${HARGS[@]}"
              cmd_status ;;
-    wait)    setup_tools; in_tmux || true; playbook site.yml --tags wait; cmd_status ;;
+    wait)    setup_tools; in_tmux || true
+             host_role_args
+             playbook site.yml --tags wait "${HARGS[@]}"; cmd_status ;;
+    addons)  setup_tools; setup_secrets
+             host_role_args
+             playbook addons.yml "${HARGS[@]}" ;;
     status)  cmd_status ;;
     autoscale) setup_tools; setup_secrets; cmd_autoscale; cmd_status ;;
     autoscale-debug) cmd_autoscale_debug ;;

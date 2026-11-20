@@ -22,7 +22,13 @@ networking:
   serviceNetwork:
     - {{ service_network }}
 platform:
-{% if ocp_is_sno %}
+{% if ocp_install_method == 'external' %}
+  # No VIPs on platform External: api/api-int/*.apps point at the load
+  # balancer (external_lb_address) or, for SNO, at the node itself.
+  external:
+    platformName: {{ external_platform_name }}
+    cloudControllerManager: External
+{% elif ocp_is_sno %}
   none: {}
 {% else %}
   baremetal:

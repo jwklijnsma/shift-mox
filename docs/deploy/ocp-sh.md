@@ -15,6 +15,7 @@ LXC: `pct enter 5099`).
 | `./ocp.sh autoscale` | set up [worker autoscaling](../autoscaling/setup.md) |
 | `./ocp.sh autoscale-debug` | one [debug report](../troubleshooting.md#autoscale-debug) for autoscaling |
 | `./ocp.sh setup` | only install tools and prepare secrets |
+| `./ocp.sh addons` | [Proxmox CSI driver](../install/csi.md) on a running cluster |
 | `./ocp.sh token` | (re)create the Proxmox API user + token |
 
 ## Options

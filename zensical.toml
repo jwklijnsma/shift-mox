@@ -22,6 +22,12 @@ nav = [
     { "cluster.yml" = "configuration/cluster.md" },
     { "Secrets" = "configuration/secrets.md" },
   ] },
+  { "Install methods" = [
+    { "Overview" = "install/methods.md" },
+    { "Installer-provisioned (ipi)" = "install/ipi.md" },
+    { "Platform External + CCM" = "install/external.md" },
+    { "Proxmox CSI driver" = "install/csi.md" },
+  ] },
   { "Deploy" = [
     { "ocp.sh" = "deploy/ocp-sh.md" },
     { "Ansible playbooks" = "deploy/ansible.md" },
@@ -37,6 +43,7 @@ nav = [
     { "How it works" = "reference/how-it-works.md" },
     { "Repository layout" = "reference/layout.md" },
     { "Releases and updates" = "reference/releases.md" },
+    { "Design: native platform" = "reference/native-platform.md" },
   ] },
 ]
 

@@ -85,7 +85,13 @@
 
     - name: Add the Calico manifests to the agent install
       ansible.builtin.include_tasks: calico.yml
+      vars:
+        agent_iso_calico_dir: "{{ work_dir }}/build/openshift"
       when: cni == 'Calico'
+
+    - name: Add the Proxmox cloud-controller-manager (platform External)
+      ansible.builtin.include_tasks: ccm.yml
+      when: ocp_install_method == 'external'
 
     - name: Run openshift-install agent create image
       ansible.builtin.command:

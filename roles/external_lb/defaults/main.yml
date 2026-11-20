@@ -1,0 +1,3 @@
+---
+# Ingress routers run on the workers; on a compact cluster (no workers) on the masters.
+external_lb_ingress_nodes: "{{ ocp_workers if (ocp_workers | length) > 0 else ocp_masters }}"

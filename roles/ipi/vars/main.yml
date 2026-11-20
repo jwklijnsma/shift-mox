@@ -1,0 +1,13 @@
+---
+ipi_pve_api: "https://{{ proxmox_api_host }}:{{ proxmox_api_port }}/api2/json"
+ipi_pve_headers:
+  Authorization: "PVEAPIToken={{ proxmox_api_user }}!{{ proxmox_api_token_id }}={{ proxmox_api_token_secret }}"
+ipi_image_file: "{{ ipi_provisioner_image_url | urlsplit('path') | basename }}"
+ipi_image_volid: "{{ ipi_provisioner_image_storage }}:import/{{ ipi_image_file }}"
+
+# On the provisioner
+ipi_dir: /opt/shiftmox
+ipi_bin_dir: "{{ ipi_dir }}/bin/{{ ocp_release }}"
+ipi_install_dir: "{{ ipi_dir }}/{{ cluster_name }}"
+# Extra manifests (Calico, hosts MachineConfigs), prepared on the controller
+ipi_manifest_dir: "{{ work_dir }}/ipi/openshift"

@@ -11,7 +11,7 @@
     ```bash
     pveum user add ansible@pve
     pveum user token add ansible@pve ocp --privsep 0
-    pveum acl modify / --users ansible@pve --roles PVEVMAdmin,PVEDatastoreAdmin,PVESDNUser
+    pveum acl modify / --users ansible@pve --roles PVEVMAdmin,PVEDatastoreAdmin,PVESDNUser,PVEAuditor
     ```
 
 - **ISO storage** that allows content `iso` (`local` by default). With VMs spread
@@ -25,11 +25,11 @@
 
 Checked by the playbook before anything is built:
 
-| Record | HA / compact | SNO |
-|---|---|---|
-| `api.<cluster>.<domain>` | `api_vip` | master-0 IP |
-| `api-int.<cluster>.<domain>` | `api_vip` | master-0 IP |
-| `*.apps.<cluster>.<domain>` | `ingress_vip` | master-0 IP |
+| Record | HA / compact | `install_method: external` | SNO |
+|---|---|---|---|
+| `api.<cluster>.<domain>` | `api_vip` | `external_lb_address` | master-0 IP |
+| `api-int.<cluster>.<domain>` | `api_vip` | `external_lb_address` | master-0 IP |
+| `*.apps.<cluster>.<domain>` | `ingress_vip` | `external_lb_address` | master-0 IP |
 
 !!! danger "No wildcard on the cluster domain itself"
     A record like `*.<cluster>.<domain>` — or a parent wildcard such as

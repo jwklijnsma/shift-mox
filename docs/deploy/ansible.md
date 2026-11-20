@@ -17,9 +17,10 @@ $EDITOR group_vars/all/cluster.yml
 
 | Playbook | Does |
 |---|---|
-| `site.yml` | preflight → tools → agent ISO → upload → VMs → wait for install |
+| `site.yml` | preflight → tools → agent ISO → upload → VMs → wait for install (per [install method](../install/methods.md)) |
 | `destroy.yml` | delete VMs (incl. autoscale workers), ISOs and state |
 | `autoscale.yml` | [worker autoscaling](../autoscaling/setup.md) |
+| `addons.yml` | [Proxmox CSI driver](../install/csi.md) (also run at the end of `site.yml`) |
 | `runner.yml` | create the [GitHub runner LXC](github-actions.md) |
 
 ```bash
@@ -34,8 +35,16 @@ ansible-playbook destroy.yml --ask-vault-pass -e confirm_destroy=<cluster_name>
 | `tools` | `tools` | download + verify `openshift-install` and `oc` |
 | `iso` | `agent_iso`, `proxmox_iso` | render configs, build the agent ISO, upload it |
 | `upload` | `proxmox_iso` | only upload the ISO |
-| `vms` | `proxmox_vms` | create and start the VMs |
+| `lb` | `external_lb` | HAProxy for api / ingress (`external` only) |
+| `bmc` | `proxmox_redfish` | Redfish BMC for all node VMs (`ipi` only) |
+| `vms` | `proxmox_vms`, `ipi` | create and start the VMs (`ipi`: create them off, plus the provisioner VM) |
+| `ipi` | `ipi` | provisioner setup and `openshift-baremetal-install create cluster` |
 | `wait` | `wait_install` | wait for bootstrap / install-complete, print access info |
+| `csi` | `proxmox_csi` | Proxmox CSI driver when `proxmox_csi_enabled` |
+
+`iso` and `upload` do nothing with `install_method: ipi` (no agent ISO).
+`lb` and `bmc` run on `-e external_lb_hosts=…` / `-e redfish_bmc_hosts=…`
+(default: the `runner` group); `./ocp.sh` on the Proxmox host passes `localhost`.
 
 ```bash
 ansible-playbook site.yml --tags iso                  # only render configs + build ISO

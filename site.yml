@@ -1,7 +1,14 @@
 ---
 # Full deploy:  ansible-playbook site.yml --ask-vault-pass
 # Only a stage: ansible-playbook site.yml --tags iso,vms
-- name: Deploy OpenShift on Proxmox VE (agent-based installer)
+#
+# install_method (cluster.yml) picks the path:
+#   agent     tools -> agent ISO -> upload -> VMs boot the ISO -> wait
+#   external  same, with platform External + Proxmox CCM, and HAProxy (lb)
+#   ipi       tools -> Redfish BMC (bmc) -> empty VMs + provisioner VM (vms)
+#             -> openshift-baremetal-install on the provisioner (ipi) -> wait
+# Afterwards: Proxmox CSI driver when proxmox_csi_enabled (addons.yml).
+- name: Deploy OpenShift on Proxmox VE
   hosts: localhost
   gather_facts: false
   module_defaults:
@@ -12,6 +19,17 @@
     PATH: "{{ ocp_bin_dir }}:{{ lookup('ansible.builtin.env', 'PATH') }}"
 
   pre_tasks:
+    - name: Check install_method
+      tags: [always]
+      ansible.builtin.assert:
+        that:
+          - ocp_install_method in ['agent', 'ipi', 'external']
+          - ocp_install_method != 'ipi' or (ocp_masters | length) == 3
+        fail_msg: >-
+          install_method must be agent, ipi or external (is: {{ ocp_install_method }}),
+          and ipi needs 3 masters.
+        quiet: true
+
     # --- Proxmox API token: checked first, before anything slow happens ------
     - name: Proxmox API preflight (token and permissions)
       tags: [always]
@@ -116,9 +134,9 @@
       changed_when: false
       failed_when: false
       loop:
-        - { name: "api.{{ cluster_name }}.{{ base_domain }}", want: "{{ api_vip if not ocp_is_sno else rendezvous_ip }}" }
-        - { name: "api-int.{{ cluster_name }}.{{ base_domain }}", want: "{{ api_vip if not ocp_is_sno else rendezvous_ip }}" }
-        - { name: "test.apps.{{ cluster_name }}.{{ base_domain }}", want: "{{ ingress_vip if not ocp_is_sno else rendezvous_ip }}" }
+        - { name: "api.{{ cluster_name }}.{{ base_domain }}", want: "{{ cluster_api_ip }}" }
+        - { name: "api-int.{{ cluster_name }}.{{ base_domain }}", want: "{{ cluster_api_ip }}" }
+        - { name: "test.apps.{{ cluster_name }}.{{ base_domain }}", want: "{{ cluster_ingress_ip }}" }
       loop_control:
         label: "{{ item.name }} -> {{ item.want }}"
 
@@ -191,7 +209,95 @@
 
   roles:
     - { role: tools, tags: [tools] }
-    - { role: agent_iso, tags: [iso] }
-    - { role: proxmox_iso, tags: [iso, upload] }
+    - { role: agent_iso, tags: [iso], when: ocp_install_method != 'ipi' }
+    - { role: proxmox_iso, tags: [iso, upload], when: ocp_install_method != 'ipi' }
+
+# --- external: HAProxy for api / ingress (no VIPs on platform External) -------
+# Override the host with -e external_lb_hosts=<group or host>; ocp.sh on the
+# Proxmox node uses the node itself (play hosts can't come from group_vars).
+- name: Load balancer for platform External
+  hosts: "{{ external_lb_hosts | default('runner') }}"
+  gather_facts: false
+  become: true
+  tags: [lb]
+  tasks:
+    - name: Facts
+      ansible.builtin.setup:
+      when: ocp_install_method == 'external' and not ocp_is_sno
+    - name: HAProxy
+      ansible.builtin.import_role:
+        name: external_lb
+      when: ocp_install_method == 'external' and not ocp_is_sno
+
+# --- ipi: the Redfish BMC must be up before the installer powers nodes on ----
+- name: Redfish BMC for the cluster VMs (ipi)
+  hosts: "{{ redfish_bmc_hosts | default('runner') }}"
+  gather_facts: false
+  become: true
+  tags: [bmc]
+  tasks:
+    - name: Facts
+      ansible.builtin.setup:
+      when: ocp_install_method == 'ipi'
+    - name: Redfish BMC emulator
+      ansible.builtin.import_role:
+        name: proxmox_redfish
+      when: ocp_install_method == 'ipi'
+
+- name: Cluster VMs (and the ipi provisioner VM)
+  hosts: localhost
+  gather_facts: false
+  module_defaults:
+    group/community.proxmox.proxmox: "{{ proxmox_auth }}"
+  environment:
+    PATH: "{{ ocp_bin_dir }}:{{ lookup('ansible.builtin.env', 'PATH') }}"
+  roles:
     - { role: proxmox_vms, tags: [vms] }
+  tasks:
+    - name: Install config and manifests for openshift-baremetal-install
+      ansible.builtin.import_role:
+        name: ipi
+        tasks_from: manifests.yml
+      when: ocp_install_method == 'ipi'
+      tags: [ipi, wait]
+    - name: Provisioner VM
+      ansible.builtin.import_role:
+        name: ipi
+        tasks_from: provisioner_vm.yml
+      when: ocp_install_method == 'ipi'
+      tags: [vms, ipi, wait]
+
+- name: Baremetal IPI install on the provisioner VM
+  hosts: ipi_provisioner
+  gather_facts: false
+  become: true
+  tags: [ipi, wait]
+  tasks:
+    - name: Provisioner host (libvirt + bridge)
+      ansible.builtin.import_role:
+        name: ipi
+        tasks_from: provisioner_host.yml
+    - name: Create the cluster with openshift-baremetal-install
+      ansible.builtin.import_role:
+        name: ipi
+        tasks_from: install.yml
+
+- name: Wait for the installation
+  hosts: localhost
+  gather_facts: false
+  module_defaults:
+    group/community.proxmox.proxmox: "{{ proxmox_auth }}"
+  roles:
     - { role: wait_install, tags: [wait] }
+  tasks:
+    - name: Delete the provisioner VM (ipi_delete_provisioner)
+      community.proxmox.proxmox_kvm:
+        node: "{{ ipi_provisioner_pve_node }}"
+        vmid: "{{ ipi_provisioner_vmid }}"
+        state: absent
+        force: true
+      when: ocp_install_method == 'ipi' and ipi_delete_provisioner | bool
+      tags: [wait]
+
+- name: Add-ons (Proxmox CSI driver)
+  ansible.builtin.import_playbook: addons.yml

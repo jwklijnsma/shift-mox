@@ -18,7 +18,11 @@ proxmox_redfish_slots: >-
   {{ ns.out }}
 # Read-only token for listing BareMetalHosts (set by autoscale.yml's first play)
 proxmox_redfish_k8s_token: "{{ hostvars['localhost']['ocp_autoscale_bmc_k8s_token'] | default('') }}"
-# DHCP with static leases for the autoscale slots (autoscale_dhcp)
+# DHCP with static leases: the autoscale slots (autoscale_dhcp) and, with
+# install_method ipi + ipi_node_network dhcp, the masters and workers
+proxmox_redfish_dhcp_hosts: >-
+  {{ (autoscale_pool if autoscale_dhcp | bool else [])
+     + (ocp_nodes if (ocp_install_method == 'ipi' and ipi_node_network == 'dhcp') else []) }}
 proxmox_redfish_dnsmasq: /usr/sbin/dnsmasq
 proxmox_redfish_netmask: >-
   {%- set p = prefix_length | int -%}

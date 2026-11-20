@@ -1,0 +1,99 @@
+---
+# Runs on the provisioner VM (become): extract openshift-baremetal-install
+# from the release, then `create cluster`. A re-run after the cluster was
+# created only waits for install-complete.
+
+- name: Directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0750"
+  loop: ["{{ ipi_dir }}", "{{ ipi_bin_dir }}"]
+
+- name: Copy oc from the controller
+  ansible.builtin.copy:
+    src: "{{ oc_bin }}"
+    dest: "{{ ipi_bin_dir }}/oc"
+    mode: "0755"
+
+- name: Pull secret
+  ansible.builtin.copy:
+    content: "{{ ocp_pull_secret }}"
+    dest: "{{ ipi_dir }}/pull-secret.json"
+    mode: "0600"
+  no_log: true
+
+# OpenShift and OKD ship the baremetal installer inside the release image;
+# it is linked against libvirt, so it has to run here, not on the controller.
+# Releases that dropped the separate binary build baremetal into
+# openshift-install itself: then that one is used.
+- name: Extract openshift-baremetal-install from the release image
+  ansible.builtin.shell: |
+    set -o pipefail
+    ex() { "{{ ipi_bin_dir }}/oc" adm release extract --registry-config="{{ ipi_dir }}/pull-secret.json" \
+             --command="$1" --to="{{ ipi_bin_dir }}" "{{ hostvars['localhost'].ipi_release_image }}"; }
+    ex openshift-baremetal-install || {
+      ex openshift-install && ln -sf openshift-install "{{ ipi_bin_dir }}/openshift-baremetal-install"
+    }
+  args:
+    executable: /bin/bash
+    creates: "{{ ipi_bin_dir }}/openshift-baremetal-install"
+
+- name: The installer runs here
+  ansible.builtin.command: "{{ ipi_bin_dir }}/openshift-baremetal-install version"
+  register: ipi_bm_version
+  changed_when: false
+
+- name: Has the cluster been created already?
+  ansible.builtin.stat:
+    path: "{{ ipi_install_dir }}/auth/kubeconfig"
+  register: ipi_auth
+
+- name: Create the cluster
+  when: not ipi_auth.stat.exists
+  block:
+    - name: Fresh install dir
+      ansible.builtin.file:
+        path: "{{ ipi_install_dir }}"
+        state: "{{ item }}"
+        mode: "0750"
+      loop: [absent, directory]
+
+    - name: Copy install-config.yaml
+      ansible.builtin.copy:
+        src: "{{ work_dir }}/ipi/install-config.yaml"
+        dest: "{{ ipi_install_dir }}/install-config.yaml"
+        mode: "0600"
+
+    - name: Create manifests
+      ansible.builtin.command: "{{ ipi_bin_dir }}/openshift-baremetal-install create manifests --dir {{ ipi_install_dir }}"
+      changed_when: true
+
+    - name: Add the extra manifests (Calico, hosts MachineConfigs)
+      ansible.builtin.copy:
+        src: "{{ ipi_manifest_dir }}/"
+        dest: "{{ ipi_install_dir }}/openshift/"
+        mode: "0600"
+
+    # Log: /opt/shiftmox/<cluster>/.openshift_install.log on the provisioner
+    - name: Install (bootstrap VM here, nodes via Redfish)
+      ansible.builtin.command: "{{ ipi_bin_dir }}/openshift-baremetal-install create cluster --dir {{ ipi_install_dir }} --log-level info"
+      environment:
+        PATH: "{{ ipi_bin_dir }}:/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin"
+      async: "{{ ipi_install_timeout | int }}"
+      poll: 60
+      changed_when: true
+
+- name: Wait for install-complete (re-run of an existing install)
+  ansible.builtin.command: "{{ ipi_bin_dir }}/openshift-baremetal-install wait-for install-complete --dir {{ ipi_install_dir }} --log-level info"
+  when: ipi_auth.stat.exists
+  async: 5400
+  poll: 60
+  changed_when: false
+
+- name: Fetch kubeconfig and kubeadmin password
+  ansible.builtin.fetch:
+    src: "{{ ipi_install_dir }}/auth/{{ item }}"
+    dest: "{{ work_dir }}/{{ item }}"
+    flat: true
+  loop: [kubeconfig, kubeadmin-password]

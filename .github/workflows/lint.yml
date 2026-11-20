@@ -30,11 +30,11 @@ jobs:
       - run: ansible-galaxy collection install -r requirements.yml -p ./collections
       - name: Syntax check
         run: |
-          for p in site.yml destroy.yml runner.yml autoscale.yml; do
+          for p in site.yml destroy.yml runner.yml autoscale.yml addons.yml; do
             ansible-playbook "$p" --syntax-check -e proxmox_api_token_secret=dummy -e redfish_bmc_password=dummy
           done
       - name: ansible-lint
-        run: ansible-lint --offline site.yml destroy.yml runner.yml autoscale.yml roles/
+        run: ansible-lint --offline site.yml destroy.yml runner.yml autoscale.yml addons.yml roles/
       - name: Python (Redfish emulator)
         run: |
           pip install -q ruff

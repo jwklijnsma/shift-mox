@@ -12,6 +12,19 @@ ocp_version: "5.0.0"                 # OpenShift: any z-stream on the mirror, e.
 okd_version: "5.0.0-okd-scos.6"      # OKD: a release tag from github.com/okd-project/okd/releases
 ocp_arch: x86_64
 cluster_name: ocp5
+
+# How the cluster is installed (details: group_vars/all/install.yml):
+#   agent     agent-based installer: Ansible creates the VMs, they boot an ISO
+#             and install themselves. Platform baremetal with VIPs. (default)
+#   ipi       installer-provisioned (baremetal IPI): Ansible only creates empty
+#             VMs; openshift-baremetal-install powers them on through the
+#             Proxmox Redfish BMC and installs them with Metal3. Every node is
+#             a BareMetalHost from the start. Needs 3 masters. Experimental.
+#   external  agent-based installer with platform External and the Proxmox
+#             cloud-controller-manager (node lifecycle + topology labels).
+#             No VIPs: an HAProxy on the runner host serves api/ingress.
+#             No Machine API, so no autoscaling. Experimental.
+install_method: agent
 base_domain: lab.example.nl          # API = api.ocp5.lab.example.nl
 
 # Where the OpenShift client tools come from (OKD always uses GitHub releases).

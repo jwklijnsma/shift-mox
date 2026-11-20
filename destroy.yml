@@ -54,6 +54,7 @@
       loop_control:
         label: "{{ item.name }} ({{ item.vmid }})"
 
+    # ipi: the Redfish emulator also put ISOs in for the masters and workers
     - name: Delete virtual-media ISOs left by the Redfish emulator
       community.proxmox.proxmox_template:
         node: "{{ item.node }}"
@@ -61,9 +62,32 @@
         content_type: iso
         template: "redfish-vmedia-{{ item.vmid }}.iso"
         state: absent
-      loop: "{{ destroy_vms.json.data | selectattr('name', 'defined') | selectattr('name', 'match', autoscale_vm_name_regex) | list }}"
+      loop: "{{ destroy_vms.json.data | selectattr('name', 'defined') | selectattr('name', 'match', redfish_vm_name_regex) | list }}"
       loop_control:
         label: "{{ item.vmid }}"
+
+    - name: Delete virtual-media ISOs of the ipi masters/workers (already deleted above)
+      community.proxmox.proxmox_template:
+        node: "{{ item.pve_node }}"
+        storage: "{{ proxmox_iso_storage }}"
+        content_type: iso
+        template: "redfish-vmedia-{{ item.vmid }}.iso"
+        state: absent
+      loop: "{{ ocp_nodes }}"
+      loop_control:
+        label: "{{ item.vmid }}"
+      when: ocp_install_method == 'ipi'
+
+    - name: Delete the ipi provisioner VM
+      community.proxmox.proxmox_kvm:
+        node: "{{ item.node }}"
+        vmid: "{{ item.vmid }}"
+        state: absent
+        force: true
+      loop: "{{ destroy_vms.json.data | selectattr('vmid', 'equalto', ipi_provisioner_vmid | int)
+                | selectattr('name', 'defined') | selectattr('name', 'equalto', ipi_provisioner_name ~ '.' ~ cluster_name) | list }}"
+      loop_control:
+        label: "{{ item.name }} ({{ item.vmid }})"
 
     - name: Delete agent ISO from Proxmox
       community.proxmox.proxmox_template:

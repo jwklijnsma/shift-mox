@@ -1,0 +1,27 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ proxmox_csi_namespace }}
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/audit: privileged
+    pod-security.kubernetes.io/warn: privileged
+    security.openshift.io/scc.podSecurityLabelSync: "false"
+---
+# The node plugin mounts block devices on the host (privileged); the
+# controller runs with a fixed UID. Both get the privileged SCC.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: proxmox-csi-scc-privileged
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:openshift:scc:privileged
+subjects:
+  - kind: ServiceAccount
+    name: proxmox-csi-plugin-controller
+    namespace: {{ proxmox_csi_namespace }}
+  - kind: ServiceAccount
+    name: proxmox-csi-plugin-node
+    namespace: {{ proxmox_csi_namespace }}

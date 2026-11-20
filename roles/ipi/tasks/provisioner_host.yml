@@ -1,0 +1,86 @@
+---
+# Runs on the provisioner VM (become): libvirt for the bootstrap VM and a
+# Linux bridge "baremetal" on the cluster network (platform.baremetal.externalBridge).
+
+- name: Wait until cloud-init is done
+  ansible.builtin.command: cloud-init status --wait
+  changed_when: false
+  failed_when: false
+
+- name: Nested virtualization must be available
+  ansible.builtin.stat:
+    path: /dev/kvm
+  register: ipi_kvm
+
+- name: Fail without /dev/kvm
+  ansible.builtin.assert:
+    that: ipi_kvm.stat.exists
+    fail_msg: >-
+      No /dev/kvm in the provisioner VM: nested virtualization is off on
+      {{ ipi_provisioner_pve_node }}. On that node: cat /sys/module/kvm_intel/parameters/nested
+      (or kvm_amd) must say Y/1 - enable it with
+      echo "options kvm-intel nested=Y" > /etc/modprobe.d/kvm-intel.conf and a reboot.
+    quiet: true
+
+- name: Install libvirt and tools
+  ansible.builtin.dnf:
+    name: [libvirt, qemu-kvm, libvirt-client, nmstate, tar, jq, NetworkManager]   # nmstate: installer validates networkConfig
+    state: present
+
+- name: Start the libvirt daemons
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    enabled: true
+    state: started
+  loop: [virtqemud.socket, virtstoraged.socket, virtnetworkd.socket, virtnodedevd.socket, virtsecretd.socket]
+
+- name: Keep cloud-init from rewriting the network on reboot
+  ansible.builtin.copy:
+    dest: /etc/cloud/cloud.cfg.d/99-shiftmox-network.cfg
+    content: "network: {config: disabled}\n"
+    mode: "0644"
+
+- name: Does the bridge exist?
+  ansible.builtin.command: nmcli -t -f NAME connection show
+  register: ipi_nm_cons
+  changed_when: false
+
+# Moving the IP from the NIC to the bridge drops SSH for a moment, so the
+# switch runs detached and Ansible reconnects afterwards.
+- name: Move the IP to bridge "baremetal"
+  when: "'baremetal' not in ipi_nm_cons.stdout_lines"
+  block:
+    - name: Bridge switch script
+      ansible.builtin.copy:
+        dest: /usr/local/sbin/shiftmox-bridge.sh
+        mode: "0755"
+        content: |
+          #!/bin/bash
+          set -u
+          dev="$(ip -4 route show default | awk '{print $5; exit}')"
+          old="$(nmcli -t -f NAME,DEVICE connection show --active | awk -F: -v d="$dev" '$2 == d {print $1; exit}')"
+          nmcli connection add type bridge ifname baremetal con-name baremetal \
+            bridge.stp no ipv4.method manual \
+            ipv4.addresses {{ ipi_provisioner_ip }}/{{ prefix_length }} \
+            ipv4.gateway {{ gateway }} ipv4.dns "{{ dns_servers | join(' ') }}" \
+            ipv4.dns-search "{{ cluster_name }}.{{ base_domain }}" ipv6.method disabled
+          nmcli connection add type bridge-slave ifname "$dev" master baremetal con-name baremetal-port
+          [ -n "$old" ] && nmcli connection modify "$old" connection.autoconnect no
+          [ -n "$old" ] && nmcli connection down "$old"
+          nmcli connection up baremetal-port
+          nmcli connection up baremetal
+
+    - name: Switch to the bridge
+      ansible.builtin.shell: nohup /usr/local/sbin/shiftmox-bridge.sh > /var/log/shiftmox-bridge.log 2>&1 &
+      changed_when: true
+
+    - name: Reconnect
+      ansible.builtin.wait_for_connection:
+        delay: 15
+        timeout: 300
+
+- name: Bridge must carry the provisioner address
+  ansible.builtin.command: ip -4 -o addr show dev baremetal
+  register: ipi_br
+  changed_when: false
+  failed_when: ipi_provisioner_ip not in ipi_br.stdout

@@ -1,0 +1,84 @@
+---
+# =============================================================================
+# Settings for the install methods (install_method in cluster.yml) and the
+# Proxmox cloud integrations. Only the block for the chosen method matters.
+# =============================================================================
+
+# --- install_method: ipi (baremetal installer-provisioned) --------------------
+#
+#   openshift-baremetal-install (on the provisioner VM)
+#        │ libvirt: temporary bootstrap VM (Ironic, API VIP)
+#        ▼
+#   Redfish BMC (proxmox-redfish, same service as for autoscaling)
+#        │ Proxmox API: power, boot order, virtual media ISO
+#        ▼
+#   master-N / worker-N VMs: created empty by Ansible, installed by Metal3
+#
+# The provisioner is a small CentOS Stream VM with libvirt (nested
+# virtualization, cpu: host). It is created from the official cloud image,
+# which Proxmox downloads itself into a storage with content "import"
+# (PVE 8.4+: Datacenter > Storage > local > Content: Import).
+ipi_provisioner_name: "provisioner"
+ipi_provisioner_vmid: "{{ (vmid_start | int) - 2 }}"      # runner LXC is vmid_start - 1
+ipi_provisioner_pve_node: "{{ proxmox_nodes[0] }}"
+ipi_provisioner_ip: 192.168.50.6                         # on machine_network, outside the node range
+ipi_provisioner_size: { cores: 6, memory: 24576, disk_gb: 150 }   # the bootstrap VM runs inside it
+ipi_provisioner_image_url: https://cloud.centos.org/centos/10-stream/x86_64/images/CentOS-Stream-GenericCloud-10-latest.x86_64.qcow2
+ipi_provisioner_image_storage: local                     # needs content "import"
+ipi_provisioner_user: cloud-user
+# Private key that matches ssh_pubkey_file (Ansible logs in with it)
+ipi_ssh_private_key_file: "{{ ssh_pubkey_file | regex_replace('\\.pub$', '') }}"
+# Delete the provisioner VM once the cluster is installed
+ipi_delete_provisioner: false
+
+# Fixed address of the temporary bootstrap VM (there is no provisioning
+# network, so the installer can't hand one out itself).
+ipi_bootstrap_ip: 192.168.50.7
+
+# Node network for masters/workers:
+#   static  nmstate config per host, matched by MAC address (not by NIC name)
+#   dhcp    static leases from proxmox-redfish-dhcp on the BMC host - the masters
+#           then depend on that host when they reboot
+ipi_node_network: static
+# Max. time for `create cluster` (seconds)
+ipi_install_timeout: 9000
+
+# --- install_method: external (platform External + Proxmox CCM) -------------
+# External platforms get no keepalived VIPs: api, api-int and *.apps must
+# point at a load balancer. Shiftmox runs HAProxy on this host (default: the
+# runner LXC; ocp.sh on the Proxmox node uses the node's bridge address).
+# For a single node (SNO) no load balancer is needed.
+external_lb_address: "{{ runner_lxc_ip }}"
+external_platform_name: proxmox
+
+# Proxmox cloud-controller-manager (github.com/sergelogvinov/proxmox-cloud-controller-manager)
+# Finds each node's VM by name + SMBIOS UUID, sets providerID proxmox://<region>/<vmid>
+# and topology labels, and deletes Node objects whose VM is gone.
+proxmox_ccm_chart: oci://ghcr.io/sergelogvinov/charts/proxmox-cloud-controller-manager
+proxmox_ccm_chart_version: "0.2.32"
+proxmox_ccm_namespace: proxmox-ccm
+
+# --- Proxmox CSI driver (any install method) ---------------------------------
+# PersistentVolumes as Proxmox disks (github.com/sergelogvinov/proxmox-csi-plugin).
+# The disk is attached to the VM of the node the pod runs on (hot-plug on the
+# VirtIO SCSI single controller the VMs already use).
+proxmox_csi_enabled: false
+proxmox_csi_chart: oci://ghcr.io/sergelogvinov/charts/proxmox-csi-plugin
+proxmox_csi_chart_version: "0.5.16"
+proxmox_csi_namespace: csi-proxmox
+proxmox_csi_storage: "{{ proxmox_disk_storage }}"
+proxmox_csi_storage_class: proxmox-data
+proxmox_csi_default_class: true
+proxmox_csi_fstype: xfs
+
+# --- Shared by CCM and CSI -----------------------------------------------------
+# Region name for topology.kubernetes.io/region (any string; CCM and CSI must agree)
+proxmox_region: "{{ cluster_name }}-pve"
+# Proxmox API as seen from inside the cluster, and the token the in-cluster
+# components use (default: the autoscale token, which defaults to the deploy
+# token). The CCM needs Sys.Audit (`./ocp.sh token` grants PVEAuditor), the CSI
+# driver VM.Config.Disk + Datastore.AllocateSpace.
+proxmox_k8s_api_url: "https://{{ autoscale_proxmox_api_host }}:{{ proxmox_api_port }}/api2/json"
+proxmox_k8s_token_id: "{{ autoscale_proxmox_token_user }}!{{ autoscale_proxmox_token_id }}"
+proxmox_k8s_token_secret: "{{ autoscale_proxmox_token_secret }}"
+proxmox_k8s_insecure: "{{ not (autoscale_proxmox_validate_certs | bool) }}"
