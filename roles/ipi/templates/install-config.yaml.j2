@@ -1,0 +1,83 @@
+{# Baremetal IPI on Proxmox: every node is a Redfish system on the Shiftmox
+   BMC (proxmox-redfish), booted with virtual media. No provisioning network. #}
+apiVersion: v1
+baseDomain: {{ base_domain }}
+metadata:
+  name: {{ cluster_name }}
+compute:
+  - name: worker
+    architecture: amd64
+    hyperthreading: Enabled
+    replicas: {{ ocp_workers | length }}
+controlPlane:
+  name: master
+  architecture: amd64
+  hyperthreading: Enabled
+  replicas: {{ ocp_masters | length }}
+networking:
+  networkType: {{ cni }}
+  machineNetwork:
+    - cidr: {{ machine_network }}
+  clusterNetwork:
+    - cidr: {{ cluster_network }}
+      hostPrefix: 23
+  serviceNetwork:
+    - {{ service_network }}
+platform:
+  baremetal:
+    apiVIPs:
+      - {{ api_vip }}
+    ingressVIPs:
+      - {{ ingress_vip }}
+    provisioningNetwork: Disabled
+    # libvirt on the provisioner VM; its bridge to the cluster network
+    externalBridge: baremetal
+    bootstrapExternalStaticIP: {{ ipi_bootstrap_ip }}
+    bootstrapExternalStaticGateway: {{ gateway }}
+    bootstrapExternalStaticDNS: {{ dns_servers[0] }}
+    hosts:
+{% for n in ocp_nodes %}
+      - name: {{ n.name }}
+        role: {{ n.role }}
+        bmc:
+          address: "{{ redfish_system_url }}{{ n.name }}.{{ cluster_name }}"
+          username: {{ redfish_bmc_user | to_json }}
+          password: {{ redfish_bmc_password | to_json }}
+          disableCertificateVerification: true
+        bootMACAddress: "{{ n.mac }}"
+        bootMode: UEFI
+        rootDeviceHints:
+          deviceName: /dev/sda
+{% if ipi_node_network == 'static' %}
+        # Matched by MAC, so the NIC name inside the ramdisk / RHCOS doesn't matter
+        networkConfig:
+          interfaces:
+            - name: {{ node_interface }}
+              type: ethernet
+              state: up
+              identifier: mac-address
+              mac-address: "{{ n.mac | upper }}"
+              ipv4:
+                enabled: true
+                dhcp: false
+                address:
+                  - ip: {{ n.ip }}
+                    prefix-length: {{ prefix_length }}
+              ipv6:
+                enabled: false
+          dns-resolver:
+            config:
+              server:
+{% for d in dns_servers %}
+                - {{ d }}
+{% endfor %}
+          routes:
+            config:
+              - destination: 0.0.0.0/0
+                next-hop-address: {{ gateway }}
+                next-hop-interface: {{ node_interface }}
+                table-id: 254
+{% endif %}
+{% endfor %}
+pullSecret: '{{ ocp_pull_secret }}'
+sshKey: '{{ lookup("ansible.builtin.file", ssh_pubkey_file) | trim }}'

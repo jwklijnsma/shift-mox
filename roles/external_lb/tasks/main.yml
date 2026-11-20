@@ -1,0 +1,29 @@
+---
+# HAProxy in front of the cluster for install_method external (no VIPs).
+# DNS: api, api-int and *.apps -> external_lb_address.
+- name: Install HAProxy
+  ansible.builtin.package:
+    name: haproxy
+
+- name: HAProxy config
+  ansible.builtin.template:
+    src: haproxy.cfg.j2
+    dest: /etc/haproxy/haproxy.cfg
+    mode: "0644"
+    validate: haproxy -c -f %s
+  notify: Restart haproxy
+
+- name: Enable and start HAProxy
+  ansible.builtin.systemd_service:
+    name: haproxy
+    enabled: true
+    state: started
+
+- name: Apply config now
+  ansible.builtin.meta: flush_handlers
+
+- name: HAProxy listens on the API port
+  ansible.builtin.wait_for:
+    host: "{{ external_lb_address }}"
+    port: 6443
+    timeout: 30

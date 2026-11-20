@@ -1,0 +1,22 @@
+---
+# Add-ons for an installed cluster (also run at the end of site.yml):
+#   ansible-playbook addons.yml --ask-vault-pass
+#
+# proxmox_csi_enabled: Proxmox CSI driver - PersistentVolumes as Proxmox disks
+# Settings: group_vars/all/install.yml
+- name: Proxmox CSI driver
+  hosts: localhost
+  gather_facts: false
+  tags: [csi]
+  environment:
+    PATH: "{{ ocp_bin_dir }}:{{ lookup('ansible.builtin.env', 'PATH') }}"
+    KUBECONFIG: "{{ work_dir }}/kubeconfig"
+  tasks:
+    - name: Tools (oc)
+      ansible.builtin.import_role:
+        name: tools
+      when: proxmox_csi_enabled | bool
+    - name: CSI driver
+      ansible.builtin.import_role:
+        name: proxmox_csi
+      when: proxmox_csi_enabled | bool

@@ -1,0 +1,57 @@
+# Managed by Ansible (roles/external_lb) - load balancer for platform External:
+# api / api-int (6443), machine config server (22623) and ingress (80, 443).
+global
+    log /dev/log local0
+    maxconn 20000
+    daemon
+
+defaults
+    mode tcp
+    log global
+    option tcplog
+    option dontlognull
+    timeout connect 10s
+    timeout client 1h
+    timeout server 1h
+    timeout check 5s
+
+listen stats
+    bind 127.0.0.1:9000
+    mode http
+    stats enable
+    stats uri /
+
+frontend api
+    bind {{ external_lb_address }}:6443
+    default_backend api
+
+backend api
+    option httpchk GET /readyz HTTP/1.0
+    http-check expect status 200
+    balance roundrobin
+{% for n in ocp_masters %}
+    server {{ n.name }} {{ n.ip }}:6443 check check-ssl verify none inter 5s fall 3 rise 2
+{% endfor %}
+
+frontend machine-config
+    bind {{ external_lb_address }}:22623
+    default_backend machine-config
+
+backend machine-config
+    balance roundrobin
+{% for n in ocp_masters %}
+    server {{ n.name }} {{ n.ip }}:22623 check inter 5s
+{% endfor %}
+
+{% for port in [80, 443] %}
+frontend ingress-{{ port }}
+    bind {{ external_lb_address }}:{{ port }}
+    default_backend ingress-{{ port }}
+
+backend ingress-{{ port }}
+    balance source
+{% for n in external_lb_ingress_nodes %}
+    server {{ n.name }} {{ n.ip }}:{{ port }} check inter 5s
+{% endfor %}
+
+{% endfor %}

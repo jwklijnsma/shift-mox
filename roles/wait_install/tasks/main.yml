@@ -5,6 +5,7 @@
   async: 4500
   poll: 30
   changed_when: false
+  when: ocp_install_method != 'ipi'
 
 - name: Wait for install-complete (up to ~90 min)
   ansible.builtin.command:
@@ -12,6 +13,14 @@
   async: 5400
   poll: 30
   changed_when: false
+  when: ocp_install_method != 'ipi'
+
+# ipi: the installer ran on the provisioner VM and the auth files were fetched
+- name: Keep the auth files private
+  ansible.builtin.file:
+    path: "{{ work_dir }}/{{ item }}"
+    mode: "0600"
+  loop: [kubeconfig, kubeadmin-password]
 
 - name: Check cluster version
   ansible.builtin.command:

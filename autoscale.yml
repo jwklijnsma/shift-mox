@@ -22,6 +22,15 @@
     PATH: "{{ ocp_bin_dir }}:{{ lookup('ansible.builtin.env', 'PATH') }}"
     KUBECONFIG: "{{ work_dir }}/kubeconfig"
   tasks:
+    - name: Autoscaling needs platform baremetal (Metal3)
+      ansible.builtin.assert:
+        that: ocp_install_method in ['agent', 'ipi'] and not ocp_is_sno
+        fail_msg: >-
+          Worker autoscaling uses Metal3 BareMetalHosts, which only exist on platform
+          baremetal with 3 masters (install_method agent or ipi). install_method external
+          has no Machine API; there the Proxmox CCM removes nodes whose VM is gone.
+        quiet: true
+      tags: [always]
     - name: Tools (oc)
       ansible.builtin.include_role:
         name: tools

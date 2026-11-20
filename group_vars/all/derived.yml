@@ -54,6 +54,20 @@ ocp_workers: "{{ ocp_nodes | selectattr('role', 'equalto', 'worker') | list }}"
 ocp_is_sno: "{{ (ocp_masters | length) == 1 and (ocp_workers | length) == 0 }}"
 rendezvous_ip: "{{ ocp_masters[0].ip }}"
 
+# --- Install method ------------------------------------------------------------
+ocp_install_method: "{{ install_method | default('agent') }}"
+# Where api / api-int and *.apps must point
+cluster_api_ip: >-
+  {{ rendezvous_ip if ocp_is_sno
+     else external_lb_address if ocp_install_method == 'external'
+     else api_vip }}
+cluster_ingress_ip: >-
+  {{ rendezvous_ip if ocp_is_sno
+     else external_lb_address if ocp_install_method == 'external'
+     else ingress_vip }}
+# Redfish BMC URL of a node VM (sushy finds the system by VM name)
+redfish_system_url: "redfish-virtualmedia+https://{{ redfish_bmc_address }}:{{ redfish_bmc_port }}/redfish/v1/Systems/"
+
 agent_iso_name: "agent-{{ cluster_name }}-{{ ocp_release }}.{{ ocp_arch }}.iso"
 
 # Used via module_defaults (group/community.proxmox.proxmox) in the playbooks
@@ -86,4 +100,9 @@ autoscale_pool: >-
   {{ ns.out }}
 # Only VMs matching this are visible to the Redfish emulator
 autoscale_vm_name_regex: '^{{ autoscale_name_prefix }}-[0-9]+\.{{ cluster_name | regex_escape }}$'
+# With install_method ipi the emulator also drives the masters and workers.
+redfish_vm_name_regex: >-
+  {{ ('^(' ~ (ocp_nodes | map(attribute='name') | map('regex_escape') | join('|'))
+      ~ '|' ~ autoscale_name_prefix ~ '-[0-9]+)\.' ~ (cluster_name | regex_escape) ~ '$')
+     if ocp_install_method == 'ipi' else autoscale_vm_name_regex }}
 helm_bin: "{{ ocp_state_dir }}/bin/helm-{{ helm_version }}/helm"

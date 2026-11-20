@@ -1,0 +1,18 @@
+---
+# Wait for a Proxmox task (ipi_upid on ipi_task_node) and fail on an error exit.
+- name: Wait for Proxmox task
+  ansible.builtin.uri:
+    url: "{{ ipi_pve_api }}/nodes/{{ ipi_task_node }}/tasks/{{ ipi_upid | urlencode }}/status"
+    headers: "{{ ipi_pve_headers }}"
+    validate_certs: "{{ proxmox_validate_certs }}"
+  register: ipi_task
+  until: ipi_task.json.data.status | default('') == 'stopped'
+  retries: 180
+  delay: 10
+  no_log: true
+
+- name: Proxmox task must succeed
+  ansible.builtin.assert:
+    that: ipi_task.json.data.exitstatus == 'OK'
+    fail_msg: "Proxmox task {{ ipi_upid }} failed: {{ ipi_task.json.data.exitstatus }}"
+    quiet: true

@@ -4,6 +4,10 @@
 # every later reboot, so the ISO never has to be ejected mid-install.
 # cpu: host is required - RHCOS 10 needs x86-64-v3 (AVX2), which the default
 # kvm64/x86-64-v2-AES CPU types do not expose.
+#
+# install_method ipi: the VMs are created empty and stay off. The installer
+# powers them on through the Redfish BMC, which puts its own boot ISO in the
+# (empty) CD drive.
 
 - name: Create OpenShift VMs
   community.proxmox.proxmox_kvm:
@@ -29,7 +33,7 @@
     scsi:
       scsi0: "{{ proxmox_disk_storage }}:{{ item.disk_gb }},iothread=1,ssd=1,discard=on"
     ide:
-      ide2: "{{ proxmox_iso_storage }}:iso/{{ agent_iso_name }},media=cdrom"
+      ide2: "{{ 'none' if ocp_install_method == 'ipi' else proxmox_iso_storage ~ ':iso/' ~ agent_iso_name }},media=cdrom"
     net:
       net0: "virtio={{ item.mac }},bridge={{ proxmox_bridge }}{{ (',tag=' ~ proxmox_vlan) if proxmox_vlan | string | length > 0 else '' }}"
     boot: "order=scsi0;ide2"
@@ -47,3 +51,4 @@
   loop: "{{ ocp_masters + ocp_workers }}"
   loop_control:
     label: "{{ item.name }}"
+  when: ocp_install_method != 'ipi'

@@ -17,7 +17,7 @@ SUSHY_PROXMOX_TOKEN_NAME = {{ autoscale_proxmox_token_id | to_json }}
 SUSHY_PROXMOX_TOKEN_SECRET = {{ autoscale_proxmox_token_secret | to_json }}
 SUSHY_PROXMOX_VERIFY_SSL = {{ proxmox_validate_certs | bool }}
 SUSHY_PROXMOX_ISO_STORAGE = {{ proxmox_iso_storage | to_json }}
-SUSHY_PROXMOX_NAME_REGEX = r"{{ autoscale_vm_name_regex }}"
+SUSHY_PROXMOX_NAME_REGEX = r"{{ redfish_vm_name_regex }}"
 
 # On-demand worker VMs: slots + reaper (empty when autoscale_vm_provisioning is kubemox)
 import json as _json

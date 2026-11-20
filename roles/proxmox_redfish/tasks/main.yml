@@ -86,6 +86,27 @@
   no_log: true
   notify: Restart proxmox-redfish
 
+# site.yml (install_method ipi) also deploys the emulator, without asking the
+# cluster for a token: keep the one autoscale.yml stored earlier, so the
+# reaper keeps working after a re-run of site.yml.
+- name: Current emulator config
+  ansible.builtin.slurp:
+    src: "{{ proxmox_redfish_conf_dir }}/emulator.conf"
+  register: proxmox_redfish_old_conf
+  failed_when: false
+  no_log: true
+  when: proxmox_redfish_k8s_token | length == 0
+
+- name: Keep the cluster token from the current config
+  ansible.builtin.set_fact:
+    proxmox_redfish_k8s_token: >-
+      {{ (proxmox_redfish_old_conf.content | b64decode)
+         | regex_findall('^SUSHY_K8S_TOKEN = "(.*)"$', multiline=True) | first | default('') }}
+  no_log: true
+  when:
+    - proxmox_redfish_k8s_token | length == 0
+    - proxmox_redfish_old_conf.content is defined
+
 - name: Emulator config (holds the Proxmox token)
   ansible.builtin.template:
     src: emulator.conf.j2
@@ -120,9 +141,9 @@
 - name: Apply restarts now
   ansible.builtin.meta: flush_handlers
 
-# --- DHCP for the autoscale slots ---------------------------------------------
+# --- DHCP: static leases for the autoscale slots (and ipi nodes in dhcp mode) --
 - name: DHCP for the autoscale slots
-  when: autoscale_dhcp | bool
+  when: proxmox_redfish_dhcp_hosts | length > 0
   block:
     - name: Install dnsmasq (binary only, no DNS service)
       ansible.builtin.package:
@@ -154,7 +175,7 @@
     name: proxmox-redfish-dhcp
     enabled: false
     state: stopped
-  when: not (autoscale_dhcp | bool)
+  when: proxmox_redfish_dhcp_hosts | length == 0
   failed_when: false
 
 - name: Apply DHCP restarts now
@@ -226,4 +247,4 @@
 
 - name: Systems exposed by the emulator
   ansible.builtin.debug:
-    msg: "{{ proxmox_redfish_systems.json['Members@odata.count'] }} VM(s) match {{ autoscale_vm_name_regex }}"
+    msg: "{{ proxmox_redfish_systems.json['Members@odata.count'] }} VM(s) match {{ redfish_vm_name_regex }}"

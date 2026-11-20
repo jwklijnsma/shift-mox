@@ -1,7 +1,7 @@
 # Repository layout
 
 ```text
-site.yml  destroy.yml  autoscale.yml  runner.yml   playbooks
+site.yml  destroy.yml  autoscale.yml  addons.yml  runner.yml   playbooks
 ocp.sh                                deploy / wait / status / destroy / autoscale from the PVE host
 ansible.cfg  requirements.yml
 zensical.toml  docs/                  this documentation site (Zensical)
@@ -10,13 +10,15 @@ inventory/hosts.yml                   localhost + Proxmox host + runner LXC
 group_vars/all/
   cluster.yml                         <- the cluster (edit this)
   autoscale.yml                       <- autoscaling settings
+  install.yml                         <- ipi / external / CCM / CSI settings
   runner.yml                          <- runner LXC
   vault.yml(.example)                 <- secrets (ansible-vault)
   derived.yml                         computed values (generated nodes, slots, ...)
 
 roles/
   tools             download + verify openshift-install and oc
-  agent_iso         render install-config / agent-config, Calico, build agent ISO
+  agent_iso         render install-config / agent-config, Calico, Proxmox CCM
+                    (external), build agent ISO
   proxmox_iso       upload the ISO to Proxmox
   proxmox_vms       create + start the VMs (UEFI, q35, cpu=host, virtio)
   wait_install      wait for bootstrap / install-complete, print access info
@@ -25,6 +27,9 @@ roles/
                     DHCP for the slots, serial console recorder
   ocp_autoscale     BareMetalHosts, MachineConfig, ClusterAutoscaler,
                     repair CronJob, (optional) kubemox pool
+  ipi               provisioner VM (libvirt), install-config, openshift-baremetal-install
+  external_lb       HAProxy for api / ingress (install_method external)
+  proxmox_csi       Proxmox CSI driver, StorageClass, topology labels
 
 .github/workflows/
   deploy.yml        manual deploy / destroy / autoscale on the self-hosted runner

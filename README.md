@@ -23,7 +23,11 @@ cluster.yml ─► Ansible ─► agent ISO ─► Proxmox API ─► VMs ─►
 
 - **One file describes the cluster** — `group_vars/all/cluster.yml`. VMs (names,
   VMIDs, IPs, MACs, placement) are generated from counts and sizes.
-- **Agent-based installer** — no PXE, no bootstrap VM, no external load balancer.
+- **Three install methods** — agent-based (default: no PXE, no bootstrap VM, no
+  external load balancer), **installer-provisioned** (baremetal IPI: the
+  installer powers and installs every VM through a Redfish BMC for Proxmox), or
+  **platform External** with the Proxmox cloud-controller-manager.
+- **Proxmox CSI driver** (optional) — PersistentVolumes as Proxmox disks.
 - **OpenShift or OKD**, **SNO / compact / standard** topologies.
 - **Calico Open Source** CNI at install time (or OVN-Kubernetes).
 - **`ocp.sh`** — runs everything on the Proxmox host itself, in tmux.
@@ -61,9 +65,10 @@ Details: [Requirements](https://jwklijnsma.github.io/shift-mox/getting-started/r
 | `./ocp.sh destroy` | delete VMs, ISO and state |
 | `./ocp.sh autoscale` | set up worker autoscaling |
 | `./ocp.sh autoscale-debug` | one report of everything autoscaling, incl. inside the worker VMs |
+| `./ocp.sh addons` | Proxmox CSI driver on a running cluster |
 | `./ocp.sh token` / `setup` | Proxmox API token / only tools and secrets |
 
-Without `ocp.sh`: `ansible-playbook site.yml | destroy.yml | autoscale.yml | runner.yml`
+Without `ocp.sh`: `ansible-playbook site.yml | destroy.yml | autoscale.yml | addons.yml | runner.yml`
 — see [Ansible playbooks](https://jwklijnsma.github.io/shift-mox/deploy/ansible/).
 
 ## Documentation
@@ -73,6 +78,7 @@ Without `ocp.sh`: `ansible-playbook site.yml | destroy.yml | autoscale.yml | run
 | [Quick start](https://jwklijnsma.github.io/shift-mox/getting-started/quickstart/) | deploy from the Proxmox host |
 | [cluster.yml](https://jwklijnsma.github.io/shift-mox/configuration/cluster/) | every setting, generated nodes, Calico, OKD vs OpenShift |
 | [Secrets](https://jwklijnsma.github.io/shift-mox/configuration/secrets/) | vault, pull secret, tokens |
+| [Install methods](https://jwklijnsma.github.io/shift-mox/install/methods/) | agent vs. installer-provisioned (ipi) vs. platform External + CCM, CSI |
 | [GitHub Actions](https://jwklijnsma.github.io/shift-mox/deploy/github-actions/) | runner LXC, secrets, workflow |
 | [Autoscaling: how it works](https://jwklijnsma.github.io/shift-mox/autoscaling/overview/) | Metal3, Redfish BMC, on-demand VMs, DHCP |
 | [Autoscaling: set up](https://jwklijnsma.github.io/shift-mox/autoscaling/setup/) | requirements, settings, what gets installed |
@@ -88,13 +94,15 @@ pip install -r requirements-docs.txt && zensical serve
 ## Layout
 
 ```text
-site.yml destroy.yml autoscale.yml runner.yml   playbooks
+site.yml destroy.yml autoscale.yml addons.yml runner.yml   playbooks
 ocp.sh                                          all-in-one wrapper for the Proxmox host
 group_vars/all/cluster.yml                      <- the cluster
 group_vars/all/autoscale.yml                    <- autoscaling
+group_vars/all/install.yml                      <- ipi / external / CCM / CSI settings
 roles/                                          tools, agent_iso, proxmox_iso, proxmox_vms,
                                                 wait_install, github_runner,
-                                                proxmox_redfish, ocp_autoscale
+                                                proxmox_redfish, ocp_autoscale, ipi,
+                                                external_lb, proxmox_csi
 docs/ zensical.toml                             documentation site (Zensical)
 .github/workflows/                              deploy, lint, docs, release, auto-release, automerge
 ```

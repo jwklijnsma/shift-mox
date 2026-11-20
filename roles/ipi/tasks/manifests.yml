@@ -1,0 +1,58 @@
+---
+# Runs on localhost: render install-config.yaml and the extra install-time
+# manifests, and look up the release image of the downloaded installer.
+
+- name: Clean ipi work dir
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: "{{ item.state }}"
+    mode: "0750"
+  loop:
+    - { path: "{{ work_dir }}/ipi", state: absent }
+    - { path: "{{ ipi_manifest_dir }}", state: directory }
+    - { path: "{{ work_dir }}/config", state: directory }
+
+- name: Render install-config.yaml (kept in config/ for review)
+  ansible.builtin.template:
+    src: install-config.yaml.j2
+    dest: "{{ item }}"
+    mode: "0600"
+  loop:
+    - "{{ work_dir }}/ipi/install-config.yaml"
+    - "{{ work_dir }}/config/install-config-ipi.yaml"
+
+- name: Calico manifests
+  ansible.builtin.include_role:
+    name: agent_iso
+    tasks_from: calico.yml
+    apply:
+      tags: [ipi, wait]
+  vars:
+    agent_iso_calico_dir: "{{ ipi_manifest_dir }}"
+  when: cni == 'Calico'
+
+# Masters and workers get their hostname from these (by MAC) on first boot,
+# so no PTR records are needed - same mechanism as the autoscale workers.
+- name: Hosts MachineConfigs (/etc/hosts + hostname by MAC)
+  ansible.builtin.template:
+    src: "{{ playbook_dir }}/roles/ocp_autoscale/templates/hosts-machineconfig.yaml.j2"
+    dest: "{{ ipi_manifest_dir }}/99-{{ item }}-openshift5-hosts.yaml"
+    mode: "0600"
+  vars:
+    hosts_mc_role: "{{ item }}"
+  loop: [master, worker]
+
+- name: Release image of this installer
+  ansible.builtin.command: "{{ ocp_install_bin }} version"
+  register: ipi_installer_version
+  changed_when: false
+
+- name: Remember the release image
+  ansible.builtin.set_fact:
+    ipi_release_image: "{{ ipi_installer_version.stdout | regex_findall('release image (\\S+)') | first | default('') }}"
+
+- name: The installer must name its release image
+  ansible.builtin.assert:
+    that: ipi_release_image | length > 0
+    fail_msg: "`openshift-install version` printed no release image: {{ ipi_installer_version.stdout }}"
+    quiet: true

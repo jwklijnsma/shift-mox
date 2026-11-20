@@ -1,0 +1,183 @@
+---
+# Runs on localhost: create (once) and start the provisioner VM, then add it
+# to the inventory as group ipi_provisioner for the next play.
+# Only the Proxmox API is used, so this works from the runner LXC too.
+
+- name: Baremetal IPI needs 3 masters
+  ansible.builtin.assert:
+    that: (ocp_masters | length) == 3
+    fail_msg: >-
+      install_method ipi needs 3 masters (ocp_master_count: 3). For a single node
+      use install_method agent or external.
+    quiet: true
+
+- name: Provisioner and bootstrap addresses must be free
+  ansible.builtin.assert:
+    that:
+      - ipi_provisioner_ip != ipi_bootstrap_ip
+      - "[ipi_provisioner_ip, ipi_bootstrap_ip] | intersect(ocp_nodes | map(attribute='ip')) | length == 0"
+      - "[ipi_provisioner_ip, ipi_bootstrap_ip] | intersect([api_vip, ingress_vip, gateway]) | length == 0"
+    fail_msg: >-
+      ipi_provisioner_ip ({{ ipi_provisioner_ip }}) and ipi_bootstrap_ip ({{ ipi_bootstrap_ip }})
+      must be two unused addresses in {{ machine_network }} (not a node IP, VIP or the gateway).
+    quiet: true
+
+- name: Private key for SSH to the provisioner
+  ansible.builtin.stat:
+    path: "{{ ipi_ssh_private_key_file }}"
+  register: ipi_key
+
+- name: Fail without the private key
+  ansible.builtin.assert:
+    that: ipi_key.stat.exists
+    fail_msg: >-
+      {{ ipi_ssh_private_key_file }} not found. Ansible logs in to the provisioner VM
+      with the key pair of ssh_pubkey_file; set ipi_ssh_private_key_file to its private key.
+    quiet: true
+
+- name: List the VMs in the Proxmox cluster
+  ansible.builtin.uri:
+    url: "{{ ipi_pve_api }}/cluster/resources?type=vm"
+    headers: "{{ ipi_pve_headers }}"
+    validate_certs: "{{ proxmox_validate_certs }}"
+  register: ipi_vms
+  no_log: true
+
+- name: Create the provisioner VM
+  when: (ipi_vms.json.data | selectattr('vmid', 'equalto', ipi_provisioner_vmid | int) | list | length) == 0
+  block:
+    - name: List the cloud images (content import) on {{ ipi_provisioner_image_storage }}
+      ansible.builtin.uri:
+        url: "{{ ipi_pve_api }}/nodes/{{ ipi_provisioner_pve_node }}/storage/{{ ipi_provisioner_image_storage }}/content?content=import"
+        headers: "{{ ipi_pve_headers }}"
+        validate_certs: "{{ proxmox_validate_certs }}"
+        status_code: [200, 400, 500]
+      register: ipi_images
+      no_log: true
+
+    - name: Storage must accept cloud images
+      ansible.builtin.assert:
+        that: ipi_images.status == 200
+        fail_msg: >-
+          Storage {{ ipi_provisioner_image_storage }} on {{ ipi_provisioner_pve_node }} does not
+          allow content "import" (Proxmox VE 8.4+). Enable it under Datacenter > Storage >
+          {{ ipi_provisioner_image_storage }} > Content: Import, or set ipi_provisioner_image_storage.
+          ({{ ipi_images.json.errors | default(ipi_images.msg | default('')) }})
+        quiet: true
+
+    - name: Let Proxmox download the cloud image
+      ansible.builtin.uri:
+        url: "{{ ipi_pve_api }}/nodes/{{ ipi_provisioner_pve_node }}/storage/{{ ipi_provisioner_image_storage }}/download-url"
+        method: POST
+        headers: "{{ ipi_pve_headers }}"
+        validate_certs: "{{ proxmox_validate_certs }}"
+        body_format: form-urlencoded
+        body:
+          content: import
+          filename: "{{ ipi_image_file }}"
+          url: "{{ ipi_provisioner_image_url }}"
+        status_code: [200, 403]
+      register: ipi_download
+      when: ipi_image_volid not in (ipi_images.json.data | map(attribute='volid') | list)
+      no_log: true
+
+    # download-url needs Sys.Modify on the node, which the deploy token
+    # deliberately doesn't have.
+    - name: Fail when the token may not download
+      ansible.builtin.assert:
+        that: ipi_download is skipped or ipi_download.status == 200
+        fail_msg: >-
+          The Proxmox token may not download into {{ ipi_provisioner_image_storage }}
+          (needs Sys.Modify on /nodes/{{ ipi_provisioner_pve_node }}). Download the image
+          once on {{ ipi_provisioner_pve_node }} yourself and re-run:
+          wget -O /var/lib/vz/import/{{ ipi_image_file }} {{ ipi_provisioner_image_url }}
+          (that path is for storage "local"; Datacenter > Storage shows the path of others).
+        quiet: true
+
+    - name: Wait for the download
+      ansible.builtin.include_tasks:
+        file: wait_task.yml
+        apply:
+          tags: [vms, ipi, wait]
+      vars:
+        ipi_upid: "{{ ipi_download.json.data }}"
+        ipi_task_node: "{{ ipi_provisioner_pve_node }}"
+      when: ipi_download is not skipped
+
+    - name: Create the VM (disk imported from the cloud image, cloud-init)
+      ansible.builtin.uri:
+        url: "{{ ipi_pve_api }}/nodes/{{ ipi_provisioner_pve_node }}/qemu"
+        method: POST
+        headers: "{{ ipi_pve_headers }}"
+        validate_certs: "{{ proxmox_validate_certs }}"
+        body_format: form-urlencoded
+        body:
+          vmid: "{{ ipi_provisioner_vmid }}"
+          name: "{{ ipi_provisioner_name }}.{{ cluster_name }}"
+          tags: "openshift;{{ cluster_name }};provisioner"
+          ostype: l26
+          machine: q35
+          cpu: host                       # nested virtualization for the bootstrap VM
+          cores: "{{ ipi_provisioner_size.cores }}"
+          memory: "{{ ipi_provisioner_size.memory }}"
+          balloon: 0
+          scsihw: virtio-scsi-single
+          scsi0: "{{ proxmox_disk_storage }}:0,import-from={{ ipi_image_volid }},iothread=1,discard=on"
+          ide2: "{{ proxmox_disk_storage }}:cloudinit"
+          boot: order=scsi0
+          serial0: socket
+          vga: serial0
+          net0: "virtio,bridge={{ proxmox_bridge }}{{ (',tag=' ~ proxmox_vlan) if proxmox_vlan | string | length > 0 else '' }}"
+          ciuser: "{{ ipi_provisioner_user }}"
+          sshkeys: "{{ lookup('ansible.builtin.file', ssh_pubkey_file) | trim | urlencode | replace('/', '%2F') }}"
+          ipconfig0: "ip={{ ipi_provisioner_ip }}/{{ prefix_length }},gw={{ gateway }}"
+          nameserver: "{{ dns_servers | join(' ') }}"
+          searchdomain: "{{ cluster_name }}.{{ base_domain }}"
+          onboot: 1
+      register: ipi_create
+      no_log: true
+
+    - name: Wait for the VM to be created
+      ansible.builtin.include_tasks:
+        file: wait_task.yml
+        apply:
+          tags: [vms, ipi, wait]
+      vars:
+        ipi_upid: "{{ ipi_create.json.data }}"
+        ipi_task_node: "{{ ipi_provisioner_pve_node }}"
+
+    - name: Grow the disk (ipi_provisioner_size.disk_gb)
+      ansible.builtin.uri:
+        url: "{{ ipi_pve_api }}/nodes/{{ ipi_provisioner_pve_node }}/qemu/{{ ipi_provisioner_vmid }}/resize"
+        method: PUT
+        headers: "{{ ipi_pve_headers }}"
+        validate_certs: "{{ proxmox_validate_certs }}"
+        body_format: form-urlencoded
+        body:
+          disk: scsi0
+          size: "{{ ipi_provisioner_size.disk_gb }}G"
+      no_log: true
+
+- name: Start the provisioner VM
+  community.proxmox.proxmox_kvm:
+    node: "{{ ipi_provisioner_pve_node }}"
+    vmid: "{{ ipi_provisioner_vmid }}"
+    state: started
+
+- name: Wait for SSH on the provisioner ({{ ipi_provisioner_ip }})
+  ansible.builtin.wait_for:
+    host: "{{ ipi_provisioner_ip }}"
+    port: 22
+    timeout: 600
+
+- name: Add the provisioner to the inventory
+  ansible.builtin.add_host:
+    name: ipi-provisioner
+    groups: [ipi_provisioner]
+    ansible_host: "{{ ipi_provisioner_ip }}"
+    ansible_user: "{{ ipi_provisioner_user }}"
+    ansible_ssh_private_key_file: "{{ ipi_ssh_private_key_file }}"
+    ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+    ansible_python_interpreter: /usr/bin/python3
+    ansible_become: true
+  changed_when: false

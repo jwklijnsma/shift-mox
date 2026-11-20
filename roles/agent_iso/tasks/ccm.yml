@@ -1,0 +1,99 @@
+---
+# Proxmox cloud-controller-manager for platform External, installed at
+# cluster-install time: with cloudControllerManager: External every kubelet
+# starts with --cloud-provider=external, and nodes keep the taint
+# node.cloudprovider.kubernetes.io/uninitialized until the CCM has found
+# their VM. So the CCM must be in the install manifests, not added later.
+#
+# DaemonSet on the masters with host networking: it runs before the pod
+# network (CNI) is up and talks straight to the Proxmox API.
+
+- name: Helm
+  ansible.builtin.include_role:
+    name: tools
+    tasks_from: helm.yml
+
+- name: CCM values (contain the Proxmox token)
+  ansible.builtin.copy:
+    dest: "{{ work_dir }}/build/proxmox-ccm-values.yaml"
+    mode: "0600"
+    content: "{{ agent_iso_ccm_values | to_nice_yaml }}"
+  vars:
+    agent_iso_ccm_values:
+      useDaemonSet: true
+      nodeSelector:
+        node-role.kubernetes.io/master: ""
+      tolerations:
+        - { key: node-role.kubernetes.io/master, operator: Exists, effect: NoSchedule }
+        - { key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule }
+        - { key: node.cloudprovider.kubernetes.io/uninitialized, operator: Exists, effect: NoSchedule }
+        - { key: node.kubernetes.io/not-ready, operator: Exists, effect: NoSchedule }
+      enabledControllers: [cloud-node, cloud-node-lifecycle]
+      config:
+        features:
+          provider: default
+        clusters:
+          - url: "{{ proxmox_k8s_api_url }}"
+            insecure: "{{ proxmox_k8s_insecure | bool }}"
+            token_id: "{{ proxmox_k8s_token_id }}"
+            token_secret: "{{ proxmox_k8s_token_secret }}"
+            region: "{{ proxmox_region }}"
+  no_log: true
+
+- name: Render the CCM chart {{ proxmox_ccm_chart_version }}
+  ansible.builtin.command:
+    argv:
+      - "{{ helm_bin }}"
+      - template
+      - proxmox-cloud-controller-manager
+      - "{{ proxmox_ccm_chart }}"
+      - --version={{ proxmox_ccm_chart_version }}
+      - --namespace={{ proxmox_ccm_namespace }}
+      - --values={{ work_dir }}/build/proxmox-ccm-values.yaml
+  register: agent_iso_ccm_render
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+- name: Fail when helm could not render the CCM chart
+  ansible.builtin.assert:
+    that: agent_iso_ccm_render.rc == 0
+    fail_msg: "helm template failed: {{ agent_iso_ccm_render.stderr | default('') }}"
+    quiet: true
+
+- name: CCM manifests into the install dir
+  ansible.builtin.copy:
+    dest: "{{ work_dir }}/build/openshift/{{ item.name }}"
+    mode: "0600"
+    content: "{{ item.content }}"
+  loop:
+    - name: 50-proxmox-ccm-namespace.yaml
+      content: |
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: {{ proxmox_ccm_namespace }}
+          labels:
+            pod-security.kubernetes.io/enforce: privileged
+            pod-security.kubernetes.io/audit: privileged
+            pod-security.kubernetes.io/warn: privileged
+            security.openshift.io/scc.podSecurityLabelSync: "false"
+        ---
+        # host network + fixed UID 10258: only the privileged SCC admits both
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: ClusterRoleBinding
+        metadata:
+          name: proxmox-ccm-scc-privileged
+        roleRef:
+          apiGroup: rbac.authorization.k8s.io
+          kind: ClusterRole
+          name: system:openshift:scc:privileged
+        subjects:
+          - kind: ServiceAccount
+            name: proxmox-cloud-controller-manager
+            namespace: {{ proxmox_ccm_namespace }}
+    - name: 51-proxmox-ccm.yaml
+      content: "{{ agent_iso_ccm_render.stdout }}"
+  loop_control:
+    label: "{{ item.name }}"
+  no_log: true

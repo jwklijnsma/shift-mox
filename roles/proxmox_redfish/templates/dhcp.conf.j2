@@ -1,5 +1,5 @@
 # Managed by Ansible (roles/proxmox_redfish): DHCP only for the autoscale
-# worker slots, so a freshly installed worker always has its network (and
+# worker slots (and the ipi nodes with ipi_node_network: dhcp), so a freshly installed worker always has its network (and
 # hostname) on first boot. Every other MAC on the network is ignored.
 port=0
 listen-address={{ redfish_bmc_address }}
@@ -12,6 +12,6 @@ dhcp-option=option:dns-server,{{ dns_servers | join(',') }}
 dhcp-option=option:domain-name,{{ cluster_name }}.{{ base_domain }}
 dhcp-leasefile=/run/proxmox-redfish-dhcp/leases
 log-dhcp
-{% for h in autoscale_pool %}
+{% for h in proxmox_redfish_dhcp_hosts %}
 dhcp-host={{ h.mac }},{{ h.ip }},{{ h.name }},infinite
 {% endfor %}

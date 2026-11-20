@@ -35,6 +35,8 @@ are created in Proxmox when they're needed and deleted again when they're not.
 | Feature | What you get |
 |---|---|
 | **Agent-based installer** | No PXE, no bootstrap VM, no external load balancer; VIPs via keepalived inside the cluster |
+| **Or installer-provisioned** | [Baremetal IPI](install/ipi.md): the installer powers and installs every VM through the Redfish BMC, or [platform External](install/external.md) with the Proxmox cloud-controller-manager |
+| **Proxmox CSI** | [Optional](install/csi.md): PersistentVolumes as Proxmox disks |
 | **OpenShift or OKD** | One setting: `ocp_distribution: ocp` or `okd` |
 | **Any topology** | Single Node OpenShift, compact (3 masters) or standard (3 masters + workers) |
 | **Automatic VMs** | Names, VMIDs, IPs, MACs and Proxmox placement are generated from counts and sizes |

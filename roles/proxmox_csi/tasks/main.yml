@@ -1,0 +1,129 @@
+---
+# Proxmox CSI driver (github.com/sergelogvinov/proxmox-csi-plugin).
+# It finds a node's VM by its providerID (platform External + CCM) or, on
+# platform baremetal, by VM name (starts with the node name) + SMBIOS UUID.
+# Volumes are placed by the topology labels region (proxmox_region) and zone
+# (Proxmox node): the CCM sets them on platform External; otherwise a small
+# CronJob does, from the node -> Proxmox node map below.
+
+- name: Helm
+  ansible.builtin.include_role:
+    name: tools
+    tasks_from: helm.yml
+
+- name: Namespace and SCC for the CSI driver
+  ansible.builtin.command:
+    argv: ["{{ oc_bin }}", apply, -f, "-"]
+    stdin: "{{ lookup('ansible.builtin.template', 'csi-prereqs.yaml.j2') }}"
+  register: proxmox_csi_prereqs
+  changed_when: proxmox_csi_prereqs.stdout is search('created|configured')
+
+- name: Topology labels (platform baremetal; the CCM does this on External)
+  when: ocp_install_method != 'external'
+  block:
+    - name: CLI image of this release
+      ansible.builtin.command:
+        argv: ["{{ oc_bin }}", -n, openshift, get, istag, "cli:latest", -o, "jsonpath={.image.dockerImageReference}"]
+      register: proxmox_csi_cli_istag
+      changed_when: false
+      failed_when: false
+
+    - name: CLI image from the release payload (fallback)
+      ansible.builtin.command:
+        argv: ["{{ oc_bin }}", adm, release, info, --image-for=cli]
+      register: proxmox_csi_cli_release
+      changed_when: false
+      when: proxmox_csi_cli_istag.rc != 0 or proxmox_csi_cli_istag.stdout | length == 0
+
+    - name: Label CronJob, its RBAC and the zone map
+      ansible.builtin.command:
+        argv: ["{{ oc_bin }}", apply, -f, "-"]
+        stdin: "{{ lookup('ansible.builtin.template', 'topology-labels.yaml.j2') }}"
+      vars:
+        proxmox_csi_cli_image: >-
+          {{ proxmox_csi_cli_istag.stdout if (proxmox_csi_cli_istag.stdout | default('') | length > 0)
+             else proxmox_csi_cli_release.stdout | trim }}
+      register: proxmox_csi_labels_apply
+      changed_when: proxmox_csi_labels_apply.stdout is search('created|configured')
+
+    - name: Label the existing nodes now
+      ansible.builtin.command:
+        argv:
+          - "{{ oc_bin }}"
+          - label
+          - node
+          - "{{ item.name }}"
+          - topology.kubernetes.io/region={{ proxmox_region }}
+          - topology.kubernetes.io/zone={{ item.pve_node }}
+          - --overwrite
+      loop: "{{ ocp_nodes }}"
+      loop_control:
+        label: "{{ item.name }} -> {{ item.pve_node }}"
+      register: proxmox_csi_label
+      changed_when: proxmox_csi_label.stdout is search('labeled') and proxmox_csi_label.stdout is not search('not labeled')
+      failed_when: proxmox_csi_label.rc != 0 and proxmox_csi_label.stderr is not search('NotFound')
+
+- name: Helm values (contain the Proxmox token)
+  ansible.builtin.copy:
+    dest: "{{ work_dir }}/proxmox-csi-values.yaml"
+    mode: "0600"
+    content: "{{ proxmox_csi_values | to_nice_yaml }}"
+  vars:
+    proxmox_csi_values:
+      createNamespace: false
+      nodeSelector:
+        node-role.kubernetes.io/master: ""
+      tolerations:
+        - { key: node-role.kubernetes.io/master, operator: Exists, effect: NoSchedule }
+        - { key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule }
+      node:
+        # masters too: on a compact cluster they run workloads
+        tolerations:
+          - { key: node-role.kubernetes.io/master, operator: Exists, effect: NoSchedule }
+          - { key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule }
+          - { key: node.kubernetes.io/unschedulable, operator: Exists, effect: NoSchedule }
+          - { key: node.kubernetes.io/disk-pressure, operator: Exists, effect: NoSchedule }
+      config:
+        clusters:
+          - url: "{{ proxmox_k8s_api_url }}"
+            insecure: "{{ proxmox_k8s_insecure | bool }}"
+            token_id: "{{ proxmox_k8s_token_id }}"
+            token_secret: "{{ proxmox_k8s_token_secret }}"
+            region: "{{ proxmox_region }}"
+      storageClass:
+        - name: "{{ proxmox_csi_storage_class }}"
+          storage: "{{ proxmox_csi_storage }}"
+          reclaimPolicy: Delete
+          fstype: "{{ proxmox_csi_fstype }}"
+          ssd: true
+          annotations:
+            storageclass.kubernetes.io/is-default-class: "{{ proxmox_csi_default_class | bool | string | lower }}"
+  no_log: true
+
+- name: Install / upgrade the Proxmox CSI driver {{ proxmox_csi_chart_version }}
+  ansible.builtin.command:
+    argv:
+      - "{{ helm_bin }}"
+      - upgrade
+      - --install
+      - proxmox-csi-plugin
+      - "{{ proxmox_csi_chart }}"
+      - --version={{ proxmox_csi_chart_version }}
+      - --namespace={{ proxmox_csi_namespace }}
+      - --values={{ work_dir }}/proxmox-csi-values.yaml
+      - --wait
+      - --timeout=10m
+  changed_when: true
+
+- name: StorageClass
+  ansible.builtin.command:
+    argv: ["{{ oc_bin }}", get, storageclass, "{{ proxmox_csi_storage_class }}"]
+  changed_when: false
+
+- name: Done
+  ansible.builtin.debug:
+    msg: >-
+      Proxmox CSI driver installed: StorageClass {{ proxmox_csi_storage_class }} creates disks on
+      Proxmox storage {{ proxmox_csi_storage }}{{ ' (default class)' if proxmox_csi_default_class | bool else '' }}.
+      Local storage (local-zfs, lvm-thin) pins a volume to one Proxmox node: its pod can only
+      run on VMs on that node.

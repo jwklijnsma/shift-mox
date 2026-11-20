@@ -1,5 +1,8 @@
 {# /etc/hosts entries for every node + spare worker, and the hostname for new
-   autoscale workers (by MAC). Replaces the need for PTR records. #}
+   autoscale workers (by MAC). Replaces the need for PTR records.
+   hosts_mc_role: worker (default) or master - the ipi install renders both
+   at install time, so a node never comes up as "localhost". #}
+{%- set mc_role = hosts_mc_role | default('worker') -%}
 {%- set ns = namespace(lines=['# ip fqdn name [mac] - managed by openshift5 autoscale.yml']) -%}
 {%- for n in ocp_nodes + autoscale_pool -%}
 {%-   set ns.lines = ns.lines + [[n.ip, n.name ~ '.' ~ cluster_name ~ '.' ~ base_domain, n.name, n.mac | default('')] | join(' ') | trim] -%}
@@ -8,9 +11,9 @@
 apiVersion: machineconfiguration.openshift.io/v1
 kind: MachineConfig
 metadata:
-  name: 99-worker-openshift5-hosts
+  name: 99-{{ mc_role }}-openshift5-hosts
   labels:
-    machineconfiguration.openshift.io/role: worker
+    machineconfiguration.openshift.io/role: {{ mc_role }}
 spec:
   config:
     ignition:
@@ -26,7 +29,7 @@ spec:
           mode: 493
           overwrite: true
           contents:
-            source: "data:text/plain;charset=utf-8;base64,{{ lookup('ansible.builtin.file', 'autoscale-hosts.sh') | b64encode }}"
+            source: "data:text/plain;charset=utf-8;base64,{{ lookup('ansible.builtin.file', playbook_dir ~ '/roles/ocp_autoscale/files/autoscale-hosts.sh') | b64encode }}"
     systemd:
       units:
         - name: autoscale-hosts.service
