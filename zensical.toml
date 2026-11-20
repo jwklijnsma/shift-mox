@@ -36,6 +36,7 @@ nav = [
   { "Reference" = [
     { "How it works" = "reference/how-it-works.md" },
     { "Repository layout" = "reference/layout.md" },
+    { "Releases and updates" = "reference/releases.md" },
   ] },
 ]
 

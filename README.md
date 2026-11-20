@@ -2,6 +2,7 @@
 
 [![Lint](https://github.com/jwklijnsma/shift-mox/actions/workflows/lint.yml/badge.svg)](https://github.com/jwklijnsma/shift-mox/actions/workflows/lint.yml)
 [![Docs](https://github.com/jwklijnsma/shift-mox/actions/workflows/docs.yml/badge.svg)](https://jwklijnsma.github.io/shift-mox/)
+[![Release](https://img.shields.io/github/v/release/jwklijnsma/shift-mox?sort=semver)](https://github.com/jwklijnsma/shift-mox/releases)
 
 Deploys **OpenShift Container Platform or OKD 5** on **Proxmox VE** with the
 agent-based installer — and makes the workers **scale themselves**, from the
@@ -95,7 +96,7 @@ roles/                                          tools, agent_iso, proxmox_iso, p
                                                 wait_install, github_runner,
                                                 proxmox_redfish, ocp_autoscale
 docs/ zensical.toml                             documentation site (Zensical)
-.github/workflows/                              deploy, lint, docs
+.github/workflows/                              deploy, lint, docs, release, auto-release, automerge
 ```
 
 > **Lab and test use.** Proxmox VE is not a Red Hat certified hypervisor for
