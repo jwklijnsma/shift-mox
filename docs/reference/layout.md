@@ -30,6 +30,9 @@ roles/
   deploy.yml        manual deploy / destroy / autoscale on the self-hosted runner
   lint.yml          syntax check, ansible-lint, ruff, shellcheck on push / PR
   docs.yml          build and publish this site to GitHub Pages
+  release.yml       tag a release + GitHub release (by hand or from auto-release)
+  auto-release.yml  release after a merged PR and every Monday
+  automerge.yml     merge patch/minor dependency PRs once checks pass
 ```
 
 ## State (not in git)
