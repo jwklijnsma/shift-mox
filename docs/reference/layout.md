@@ -5,6 +5,7 @@ site.yml  destroy.yml  autoscale.yml  addons.yml  runner.yml   playbooks
 ocp.sh                                deploy / wait / status / destroy / autoscale from the PVE host
 ansible.cfg  requirements.yml
 zensical.toml  docs/                  this documentation site (Zensical)
+renovate.json                         what Renovate updates (see Releases and updates)
 
 inventory/hosts.yml                   localhost + Proxmox host + runner LXC
 group_vars/all/
@@ -38,6 +39,7 @@ roles/
   release.yml       tag a release + GitHub release (by hand or from auto-release)
   auto-release.yml  release after a merged PR and every Monday
   automerge.yml     merge patch/minor dependency PRs once checks pass
+  renovate.yml      run Renovate (dependency update PRs) every 4 hours
 ```
 
 ## State (not in git)
