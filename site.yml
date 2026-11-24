@@ -121,6 +121,13 @@
         # "local" is per node; any other storage name is assumed to be shared
         _iso_local_ok: "{{ proxmox_iso_storage != 'local' or _vm_nodes == [proxmox_iso_node] }}"
 
+    # Storage, bridge, VMIDs, sizes, IPs, pull secret, SSH key against reality
+    - name: Check cluster.yml against the real Proxmox cluster
+      ansible.builtin.import_role:
+        name: preflight
+      tags: [always]
+      when: not (preflight_skip | default(false) | bool)
+
     - name: DNS preflight (api, api-int, *.apps must resolve)
       tags: [always]
       # With dns_check_server set, ask that server directly (dig never appends

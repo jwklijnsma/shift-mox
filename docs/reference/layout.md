@@ -17,6 +17,7 @@ group_vars/all/
   derived.yml                         computed values (generated nodes, slots, ...)
 
 roles/
+  preflight         check cluster.yml against the real Proxmox cluster
   tools             download + verify openshift-install and oc
   agent_iso         render install-config / agent-config, Calico, Proxmox CCM
                     (external), build agent ISO

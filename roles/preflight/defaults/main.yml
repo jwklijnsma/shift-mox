@@ -1,0 +1,6 @@
+---
+# Skip the "does cluster.yml match reality" checks: -e preflight_skip=true
+preflight_skip: false
+# Ping planned node IPs / VIPs to find addresses that are already taken.
+# Only meaningful when this host can reach machine_network.
+preflight_ping: true
