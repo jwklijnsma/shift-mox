@@ -291,6 +291,11 @@
       {%- endfor -%}
       {{ ns.out }}
 
+- name: Slots of the broken hosts (to find their Proxmox cluster)
+  ansible.builtin.set_fact:
+    ocp_autoscale_broken_slots: >-
+      {{ autoscale_pool | selectattr('name', 'in', ocp_autoscale_broken | map(attribute='name') | list) | list }}
+
 - name: Repair broken autoscale hosts
   when: ocp_autoscale_broken | length > 0
   block:
@@ -307,31 +312,43 @@
         label: "{{ item.name }}"
       changed_when: true
 
+    # Each slot's VM lives on the Proxmox cluster of that slot (pve_cluster).
     - name: VMs in Proxmox (leftovers of the broken hosts)
       ansible.builtin.uri:
-        url: "https://{{ proxmox_api_host }}:{{ proxmox_api_port }}/api2/json/cluster/resources?type=vm"
+        url: "https://{{ _c.api_host }}:{{ _c.api_port }}/api2/json/cluster/resources?type=vm"
         headers:
-          Authorization: "PVEAPIToken={{ proxmox_api_user }}!{{ proxmox_api_token_id }}={{ proxmox_api_token_secret }}"
-        validate_certs: "{{ proxmox_validate_certs }}"
+          Authorization: "PVEAPIToken={{ _c.api_user }}!{{ _c.api_token_id }}={{ _c.api_token_secret }}"
+        validate_certs: "{{ _c.validate_certs }}"
+      vars:
+        _c: "{{ pve_clusters[item] }}"
+      loop: "{{ ocp_autoscale_broken_slots | map(attribute='pve_cluster') | unique | list }}"
       register: ocp_autoscale_pve_vms2
       no_log: true
       when: autoscale_vm_provisioning == 'on_demand'
 
     - name: Delete leftover VMs of the broken hosts (on demand, the VM comes back when needed)
       community.proxmox.proxmox_kvm:
+        api_host: "{{ pve_auth[item.cluster].api_host }}"
+        api_port: "{{ pve_auth[item.cluster].api_port }}"
+        api_user: "{{ pve_auth[item.cluster].api_user }}"
+        api_token_id: "{{ pve_auth[item.cluster].api_token_id }}"
+        api_token_secret: "{{ pve_auth[item.cluster].api_token_secret }}"
+        validate_certs: "{{ pve_auth[item.cluster].validate_certs }}"
         node: "{{ item.node }}"
         vmid: "{{ item.vmid }}"
         state: absent
         force: true
-      module_defaults:
-        group/community.proxmox.proxmox: "{{ proxmox_auth }}"
       loop: >-
-        {{ ocp_autoscale_pve_vms2.json.data | default([]) | selectattr('name', 'defined')
-           | selectattr('name', 'in', autoscale_pool | selectattr('name', 'in', ocp_autoscale_broken | map(attribute='name') | list)
-                                                       | map(attribute='vm_name') | list)
-           | list }}
+        {%- set ns = namespace(out=[]) -%}
+        {%- for r in ocp_autoscale_pve_vms2.results | default([]) if r.json is defined -%}
+          {%- set names = ocp_autoscale_broken_slots | selectattr('pve_cluster', 'equalto', r.item) | map(attribute='vm_name') | list -%}
+          {%- for v in r.json.data if v.name | default('') in names -%}
+            {%- set ns.out = ns.out + [v | combine({'cluster': r.item})] -%}
+          {%- endfor -%}
+        {%- endfor -%}
+        {{ ns.out }}
       loop_control:
-        label: "{{ item.name }} ({{ item.vmid }})"
+        label: "{{ item.name }} ({{ item.cluster }}/{{ item.vmid }})"
       when: autoscale_vm_provisioning == 'on_demand'
 
 - name: Does this BareMetalHost API have spec.inspectionMode?

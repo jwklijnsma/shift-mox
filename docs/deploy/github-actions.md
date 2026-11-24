@@ -62,6 +62,11 @@ Repo › Settings › Environments › New environment `proxmox`:
 | `OCP_SSH_PUBKEY` | public SSH key for the `core` user |
 | `ANSIBLE_VAULT_PASSWORD` | optional, only with a committed encrypted `vault.yml` |
 | `REDFISH_BMC_PASSWORD` | for the `autoscale` stage: same as the BMC's `redfish_bmc_password` |
+| `SHIFTMOX_EXTRA_VARS` | optional JSON with more variables, e.g. `{"vault_site2_token_secret": "…"}` for [another Proxmox cluster](../configuration/multi-proxmox.md) |
+
+For an [environment](../configuration/environments.md) `lab`, create the GitHub
+environment **`proxmox-lab`** with its own secrets and run the workflow with
+input *environment* = `lab`. Runs of different environments don't block each other.
 
 !!! tip
     Add yourself as **required reviewer** on the environment to get an approval
@@ -78,6 +83,7 @@ Actions › *Deploy OpenShift on Proxmox* › Run workflow:
 | stage = wait | re-attach to an install that is running |
 | stage = autoscale | autoscaling, cluster part (see below) |
 | rebuild_iso = true | after changing `cluster.yml` before the VMs exist |
+| environment = lab | work on `environments/lab/` (secrets from GitHub environment `proxmox-lab`) |
 | action = destroy, confirm = `<cluster_name>` | delete VMs, ISO and state |
 
 **Autoscale stage:** the runner user can't install system services, so install

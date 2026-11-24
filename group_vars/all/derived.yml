@@ -47,7 +47,67 @@ ocp_nodes_generated: >-
   {%- endfor -%}
   {{ ns.out }}
 
-ocp_nodes: "{{ ocp_nodes_manual if (ocp_nodes_manual | length) > 0 else ocp_nodes_generated }}"
+# --- Proxmox clusters -----------------------------------------------------------
+# The main cluster (proxmox_api_*, proxmox_*_storage, proxmox_bridge) plus the
+# independent ones in proxmox_clusters, each with every setting filled in.
+pve_clusters: >-
+  {%- set main = {
+        'api_host': proxmox_api_host, 'api_port': proxmox_api_port | int,
+        'api_user': proxmox_api_user, 'api_token_id': proxmox_api_token_id,
+        'api_token_secret': proxmox_api_token_secret, 'validate_certs': proxmox_validate_certs | bool,
+        'iso_node': proxmox_iso_node, 'iso_storage': proxmox_iso_storage,
+        'disk_storage': proxmox_disk_storage, 'bridge': proxmox_bridge,
+        'vlan': proxmox_vlan | default('') | string, 'region': proxmox_region } -%}
+  {%- set ns = namespace(out={proxmox_main_cluster: main}) -%}
+  {%- for name, c in (proxmox_clusters | default({})).items() -%}
+    {%- set ns.out = ns.out | combine({name: main | combine({'iso_node': '', 'region': name}) | combine(c)}) -%}
+  {%- endfor -%}
+  {{ ns.out }}
+# Module arguments for community.proxmox per cluster
+pve_auth: >-
+  {%- set ns = namespace(out={}) -%}
+  {%- for name, c in pve_clusters.items() -%}
+    {%- set ns.out = ns.out | combine({name: {
+          'api_host': c.api_host, 'api_port': c.api_port | int, 'api_user': c.api_user,
+          'api_token_id': c.api_token_id, 'api_token_secret': c.api_token_secret,
+          'validate_certs': c.validate_certs | bool}}) -%}
+  {%- endfor -%}
+  {{ ns.out }}
+
+# Node list with the placement resolved: "site2/pve11" -> pve_cluster site2,
+# pve_node pve11; a bare node name is on the main cluster. Each node also gets
+# its cluster's storage / bridge / VLAN (a node_overrides entry can set them).
+ocp_nodes: >-
+  {%- set ns = namespace(out=[]) -%}
+  {%- for n in (ocp_nodes_manual if (ocp_nodes_manual | length) > 0 else ocp_nodes_generated) -%}
+    {%- set place = (n.pve_node | string).split('/', 1) -%}
+    {%- set cl = place[0] if place | length == 2 else (n.pve_cluster | default(proxmox_main_cluster)) -%}
+    {%- set c = pve_clusters[cl] | default({}) -%}
+    {%- set ns.out = ns.out + [{'storage': c.disk_storage | default(proxmox_disk_storage),
+                                'bridge': c.bridge | default(proxmox_bridge),
+                                'vlan': c.vlan | default('') | string}
+                               | combine(n)
+                               | combine({'pve_cluster': cl, 'pve_node': place | last})] -%}
+  {%- endfor -%}
+  {{ ns.out }}
+# Nodes of the main cluster named in proxmox_nodes (bare or "main/<node>")
+proxmox_main_nodes: >-
+  {{ (proxmox_nodes | map('string') | reject('search', '/') | list)
+     + (proxmox_nodes | map('string') | select('match', proxmox_main_cluster ~ '/') | map('regex_replace', '^[^/]+/', '') | list) }}
+# Proxmox clusters this cluster's VMs use (main first)
+pve_clusters_used: "{{ ([proxmox_main_cluster] + (ocp_nodes | map(attribute='pve_cluster') | list)) | unique | list }}"
+# Where the agent ISO goes, per used cluster: {cluster: {node, storage}}
+pve_iso_targets: >-
+  {%- set ns = namespace(out={}) -%}
+  {%- for cl in pve_clusters_used -%}
+    {%- set vm_nodes = ocp_nodes | selectattr('pve_cluster', 'equalto', cl) | map(attribute='pve_node') | list -%}
+    {%- set node = pve_clusters[cl].iso_node if (pve_clusters[cl].iso_node | default('') | length > 0)
+                   else (vm_nodes | first | default('')) -%}
+    {%- if node | length > 0 -%}
+      {%- set ns.out = ns.out | combine({cl: {'node': node, 'storage': pve_clusters[cl].iso_storage}}) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {{ ns.out }}
 
 ocp_masters: "{{ ocp_nodes | selectattr('role', 'equalto', 'master') | list }}"
 ocp_workers: "{{ ocp_nodes | selectattr('role', 'equalto', 'worker') | list }}"
@@ -89,10 +149,17 @@ autoscale_pool: >-
   {%- for i in range(autoscale_pool_size | int) -%}
     {%- set n = base + i -%}
     {%- set b = [(n // 16777216) % 256, (n // 65536) % 256, (n // 256) % 256, n % 256] -%}
+    {%- set place = (autoscale_proxmox_nodes[i % (autoscale_proxmox_nodes | length)] | string).split('/', 1) -%}
+    {%- set cl = place[0] if place | length == 2 else proxmox_main_cluster -%}
+    {%- set c = pve_clusters[cl] | default({}) -%}
     {%- set ns.out = ns.out + [{
           'name': autoscale_name_prefix ~ '-' ~ i,
           'vm_name': autoscale_name_prefix ~ '-' ~ i ~ '.' ~ cluster_name,
-          'pve_node': autoscale_proxmox_nodes[i % (autoscale_proxmox_nodes | length)],
+          'pve_cluster': cl,
+          'pve_node': place | last,
+          'storage': c.disk_storage | default(proxmox_disk_storage),
+          'bridge': c.bridge | default(proxmox_bridge),
+          'vlan': c.vlan | default('') | string,
           'ip': b | join('.'),
           'mac': '52:54:00:%02x:%02x:%02x' | format(b[1], b[2], b[3]),
         } | combine(autoscale_worker_size)] -%}

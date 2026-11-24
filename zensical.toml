@@ -21,6 +21,8 @@ nav = [
   { "Configuration" = [
     { "cluster.yml" = "configuration/cluster.md" },
     { "Secrets" = "configuration/secrets.md" },
+    { "Environments" = "configuration/environments.md" },
+    { "Several Proxmox clusters" = "configuration/multi-proxmox.md" },
   ] },
   { "Install methods" = [
     { "Overview" = "install/methods.md" },

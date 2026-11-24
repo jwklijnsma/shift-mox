@@ -20,7 +20,7 @@
 # (PVE 8.4+: Datacenter > Storage > local > Content: Import).
 ipi_provisioner_name: "provisioner"
 ipi_provisioner_vmid: "{{ (vmid_start | int) - 2 }}"      # runner LXC is vmid_start - 1
-ipi_provisioner_pve_node: "{{ proxmox_nodes[0] }}"
+ipi_provisioner_pve_node: "{{ proxmox_main_nodes | first | default(proxmox_nodes[0]) }}"   # on the main Proxmox cluster
 ipi_provisioner_ip: 192.168.50.6                         # on machine_network, outside the node range
 ipi_provisioner_size: { cores: 6, memory: 24576, disk_gb: 150 }   # the bootstrap VM runs inside it
 ipi_provisioner_image_url: https://cloud.centos.org/centos/10-stream/x86_64/images/CentOS-Stream-GenericCloud-10-latest.x86_64.qcow2
@@ -72,7 +72,8 @@ proxmox_csi_default_class: true
 proxmox_csi_fstype: xfs
 
 # --- Shared by CCM and CSI -----------------------------------------------------
-# Region name for topology.kubernetes.io/region (any string; CCM and CSI must agree)
+# Region name for topology.kubernetes.io/region of the main Proxmox cluster
+# (any string; CCM and CSI must agree). Other clusters: proxmox_clusters.<x>.region
 proxmox_region: "{{ cluster_name }}-pve"
 # Proxmox API as seen from inside the cluster, and the token the in-cluster
 # components use (default: the autoscale token, which defaults to the deploy
@@ -82,3 +83,28 @@ proxmox_k8s_api_url: "https://{{ autoscale_proxmox_api_host }}:{{ proxmox_api_po
 proxmox_k8s_token_id: "{{ autoscale_proxmox_token_user }}!{{ autoscale_proxmox_token_id }}"
 proxmox_k8s_token_secret: "{{ autoscale_proxmox_token_secret }}"
 proxmox_k8s_insecure: "{{ not (autoscale_proxmox_validate_certs | bool) }}"
+# All Proxmox clusters for CCM / CSI (config "clusters:" list). The main one
+# uses the settings above, the others their own API and token from
+# proxmox_clusters; each is its own topology region.
+proxmox_k8s_clusters: >-
+  {%- set used = (pve_clusters_used + (autoscale_pool | map(attribute='pve_cluster') | list)) | unique | list -%}
+  {%- set ns = namespace(out=[]) -%}
+  {%- for cl in used if cl in pve_clusters -%}
+    {%- set c = pve_clusters[cl] -%}
+    {%- if cl == proxmox_main_cluster -%}
+      {%- set ns.out = ns.out + [{'url': proxmox_k8s_api_url, 'insecure': proxmox_k8s_insecure | bool,
+            'token_id': proxmox_k8s_token_id, 'token_secret': proxmox_k8s_token_secret, 'region': proxmox_region}] -%}
+    {%- else -%}
+      {%- set ns.out = ns.out + [{'url': 'https://' ~ c.api_host ~ ':' ~ c.api_port ~ '/api2/json',
+            'insecure': not (c.validate_certs | bool), 'token_id': c.api_user ~ '!' ~ c.api_token_id,
+            'token_secret': c.api_token_secret, 'region': c.region}] -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {{ ns.out }}
+# Topology region of a Proxmox cluster
+proxmox_k8s_regions: >-
+  {%- set ns = namespace(out={}) -%}
+  {%- for cl, c in pve_clusters.items() -%}
+    {%- set ns.out = ns.out | combine({cl: proxmox_region if cl == proxmox_main_cluster else c.region}) -%}
+  {%- endfor -%}
+  {{ ns.out }}

@@ -1,0 +1,4 @@
+# Managed by Ansible (roles/proxmox_redfish) - DHCP on this host's address
+# {{ redfish_bmc_address }} (static leases only)
+listen-address={{ redfish_bmc_address }}
+dhcp-range={{ redfish_bmc_address }},static,{{ proxmox_redfish_netmask }},12h

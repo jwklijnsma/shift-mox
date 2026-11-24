@@ -53,7 +53,7 @@ touched.
 | `autoscale_min_workers` | `ocp_worker_count` | lower bound for the autoscaler |
 | `autoscale_max_workers` | `6` | upper bound; slots = max − installed workers |
 | `autoscale_worker_size` | `worker_size` | CPU / RAM / disk of new workers |
-| `autoscale_proxmox_nodes` | `proxmox_nodes` | where new VMs go (round-robin) |
+| `autoscale_proxmox_nodes` | `proxmox_nodes` | where new VMs go (round-robin); `<cluster>/<node>` for [another Proxmox cluster](../configuration/multi-proxmox.md) |
 | `autoscale_name_prefix` | `worker-auto` | slot names `worker-auto-0..N` |
 | `autoscale_vm_provisioning` | `on_demand` | or `kubemox` (pre-created pool) |
 | `autoscale_vm_delete_grace` | `300` | seconds a released VM is off before deletion |

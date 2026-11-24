@@ -34,12 +34,16 @@ ocp_mirror_base: "https://mirror.openshift.com/pub/openshift-v5/{{ ocp_arch }}/c
 # State dir on the controller/runner: downloaded tools, install state,
 # kubeconfig + kubeadmin password. The GitHub workflow points this outside
 # the checkout (/var/lib/ocp-deploy) so it survives between runs.
-ocp_state_dir: "{{ playbook_dir }}/.work"
+# Environment (./ocp.sh -E <name>, or -e shiftmox_env=<name> -e @environments/<name>/cluster.yml):
+# every environment is its own cluster with its own state, secrets and BMC service.
+shiftmox_env: ""
+ocp_state_dir: "{{ playbook_dir }}/.work{{ ('/env/' ~ shiftmox_env) if shiftmox_env | length > 0 else '' }}"
 work_dir: "{{ ocp_state_dir }}/{{ cluster_name }}"
 
 # Pull secret from https://console.redhat.com/openshift/install/pull-secret
 # (OpenShift only - OKD uses a placeholder and ignores this file)
-pull_secret_file: "{{ playbook_dir }}/secrets/pull-secret.json"
+pull_secret_file: >-
+  {{ playbook_dir ~ ('/environments/' ~ shiftmox_env ~ '/secrets' if shiftmox_env | length > 0 else '/secrets') ~ '/pull-secret.json' }}
 ssh_pubkey_file: "~/.ssh/id_ed25519.pub"
 
 # --- Network -----------------------------------------------------------------
@@ -77,13 +81,40 @@ proxmox_api_token_id: ocp
 # Give Proxmox a real cert (Datacenter > ACME, Let's Encrypt). Only set false
 # for a self-signed lab box that is NOT internet-facing.
 proxmox_validate_certs: false
-# Node that receives the ISO upload. Defaults to the first VM node; with
-# node-local ISO storage (like "local") it must be the node the VMs run on.
-proxmox_iso_node: "{{ proxmox_nodes[0] }}"
+# Node that receives the ISO upload. Empty: the first VM node on this Proxmox
+# cluster; with node-local ISO storage (like "local") it must be the node the
+# VMs run on.
+proxmox_iso_node: ""
 proxmox_iso_storage: local           # must allow content "iso" (shared storage if VMs are spread over nodes)
 proxmox_disk_storage: local-zfs
 proxmox_bridge: vmbr1
 proxmox_vlan: ""                     # e.g. "50" for tagged
+
+# --- More, independent Proxmox clusters (optional) ----------------------------
+# The settings above are the "main" Proxmox cluster. VMs can also go to other,
+# independent Proxmox clusters (their own API and token): name them here and
+# place VMs with "<cluster>/<node>" in proxmox_nodes, autoscale_proxmox_nodes
+# or node_overrides (pve_node). All clusters must carry the same L2 network
+# (machine_network, VIPs, DHCP for autoscale workers) - e.g. a stretched VLAN.
+#
+# proxmox_clusters:
+#   site2:
+#     api_host: 10.20.0.11
+#     api_token_secret: "{{ vault_site2_token_secret }}"   # in vault.yml
+#     # optional, default = the main cluster's value:
+#     api_port: 8006
+#     api_user: ansible@pve
+#     api_token_id: ocp
+#     validate_certs: false
+#     iso_node: pve11            # default: first VM node on site2
+#     iso_storage: local
+#     disk_storage: local-lvm
+#     bridge: vmbr1
+#     vlan: ""
+#     region: site2              # topology.kubernetes.io/region (CCM / CSI)
+proxmox_clusters: {}
+# Name of the main cluster in placements ("main/node02" = "node02")
+proxmox_main_cluster: main
 
 # --- Nodes -------------------------------------------------------------------
 # 1 master            -> Single Node OpenShift (SNO)
@@ -101,7 +132,7 @@ ocp_worker_count: 2
 
 vmid_start: 5100
 ip_start: 192.168.50.21
-proxmox_nodes: [node02]               # e.g. [pve01, pve02, pve03] for HA placement
+proxmox_nodes: [node02]               # e.g. [pve01, pve02, pve03] or [node02, site2/pve11, site3/pve21]
 
 master_size: { cores: 8, memory: 24576, disk_gb: 120 }
 worker_size: { cores: 8, memory: 16384, disk_gb: 120 }

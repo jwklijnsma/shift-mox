@@ -1,0 +1,45 @@
+---
+# Environment "@ENV@" - one OpenShift / OKD cluster.
+#
+#   ./ocp.sh -E @ENV@ deploy | wait | status | autoscale | destroy
+#
+# Everything in group_vars/all/*.yml is the default; this file only holds
+# what is different for this cluster (it is loaded as extra vars, so it wins).
+# Secrets: environments/@ENV@/vault.yml (created by ./ocp.sh -E @ENV@ setup)
+# and environments/@ENV@/secrets/pull-secret.json. State: .work/env/@ENV@/.
+#
+# Each environment needs its own cluster_name, addresses and VMIDs - nothing
+# may overlap with another environment on the same Proxmox / network.
+
+cluster_name: "@ENV@"
+base_domain: lab.example.nl
+ocp_distribution: ocp            # ocp | okd
+install_method: agent            # agent | ipi | external
+
+machine_network: 192.168.60.0/24
+gateway: 192.168.60.1
+dns_servers: [192.168.60.200]
+api_vip: 192.168.60.10
+ingress_vip: 192.168.60.11
+ip_start: 192.168.60.21
+vmid_start: 5200
+
+ocp_master_count: 3
+ocp_worker_count: 2
+
+# Proxmox: the main cluster (from group_vars) plus, optionally, independent
+# clusters. A placement "<cluster>/<node>" puts a VM on another cluster.
+proxmox_nodes: [node02]
+# proxmox_bridge: vmbr2
+# proxmox_vlan: "60"
+# proxmox_clusters:
+#   site2:
+#     api_host: 10.20.0.11
+#     api_token_secret: "{{ vault_site2_token_secret }}"   # in vault.yml
+#     disk_storage: local-lvm
+#     bridge: vmbr1
+# autoscale_proxmox_nodes: [node02, site2/pve11]
+
+# Autoscaling: if another environment's Redfish BMC runs on the same host,
+# give this one its own port.
+# redfish_bmc_port: 8444

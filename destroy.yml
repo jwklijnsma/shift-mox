@@ -7,95 +7,104 @@
   module_defaults:
     group/community.proxmox.proxmox: "{{ proxmox_auth }}"
 
+  vars:
+    # every Proxmox cluster the VMs or autoscale slots are on
+    destroy_clusters: "{{ (pve_clusters_used + (autoscale_pool | map(attribute='pve_cluster') | list)) | unique | select('in', pve_clusters) | list }}"
+    destroy_vms: >-
+      {%- set ns = namespace(out=[]) -%}
+      {%- for r in destroy_lists.results | default([]) -%}
+        {%- for v in r.json.data | default([]) if v.name is defined -%}
+          {%- set ns.out = ns.out + [v | combine({'cluster': r.item})] -%}
+        {%- endfor -%}
+      {%- endfor -%}
+      {{ ns.out }}
+    # cluster/vmid/name of every VM this cluster planned (nodes + ipi provisioner)
+    destroy_keys: >-
+      {{ (ocp_nodes | map(attribute='pve_cluster') | zip(ocp_nodes | map(attribute='vmid'), ocp_nodes | map(attribute='name'))
+          | map('join', '/') | map('regex_replace', '$', '.' ~ cluster_name) | list)
+         + [proxmox_main_cluster ~ '/' ~ ipi_provisioner_vmid ~ '/' ~ ipi_provisioner_name ~ '.' ~ cluster_name] }}
+    destroy_targets: >-
+      {%- set ns = namespace(out=[]) -%}
+      {%- for v in destroy_vms -%}
+        {%- if v.name is match(autoscale_vm_name_regex) or (v.cluster ~ '/' ~ v.vmid ~ '/' ~ v.name) in destroy_keys -%}
+          {%- set ns.out = ns.out + [v] -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ ns.out }}
+
   tasks:
     - name: Require the cluster name as confirmation
       ansible.builtin.assert:
         that: confirm_destroy | default('') == cluster_name
-        fail_msg: "Re-run with -e confirm_destroy={{ cluster_name }} to delete VMs {{ ocp_nodes | map(attribute='vmid') | join(', ') }}."
+        fail_msg: >-
+          Re-run with -e confirm_destroy={{ cluster_name }} to delete VMs
+          {{ ocp_nodes | map(attribute='pve_cluster') | zip(ocp_nodes | map(attribute='vmid')) | map('join', '/') | join(', ') }}
+          (only VMs whose VMID and name match are deleted).
 
-    - name: Stop VMs
-      community.proxmox.proxmox_kvm:
-        node: "{{ item.pve_node }}"
-        vmid: "{{ item.vmid }}"
-        state: stopped
-        force: true
-      loop: "{{ ocp_nodes }}"
-      loop_control:
-        label: "{{ item.name }}"
-      failed_when: false
-
-    - name: Delete VMs (disks included)
-      community.proxmox.proxmox_kvm:
-        node: "{{ item.pve_node }}"
-        vmid: "{{ item.vmid }}"
-        state: absent
-      loop: "{{ ocp_nodes }}"
-      loop_control:
-        label: "{{ item.name }}"
-
-    # Spare autoscale VMs were created by kubemox with VMIDs it picked itself,
-    # so find them by name.
-    - name: Find autoscale spare VMs
+    # One lookup per Proxmox cluster; every entry tagged with its cluster.
+    # Only VMs whose VMID *and* name match this cluster are touched.
+    - name: List the VMs on every Proxmox cluster
       ansible.builtin.uri:
-        url: "https://{{ proxmox_api_host }}:{{ proxmox_api_port }}/api2/json/cluster/resources?type=vm"
+        url: "https://{{ _c.api_host }}:{{ _c.api_port }}/api2/json/cluster/resources?type=vm"
         headers:
-          Authorization: "PVEAPIToken={{ proxmox_api_user }}!{{ proxmox_api_token_id }}={{ proxmox_api_token_secret }}"
-        validate_certs: "{{ proxmox_validate_certs }}"
-      register: destroy_vms
+          Authorization: "PVEAPIToken={{ _c.api_user }}!{{ _c.api_token_id }}={{ _c.api_token_secret }}"
+        validate_certs: "{{ _c.validate_certs }}"
+      vars:
+        _c: "{{ pve_clusters[item] }}"
+      loop: "{{ destroy_clusters }}"
+      register: destroy_lists
       no_log: true
 
-    - name: Stop and delete autoscale spare VMs
+    - name: Stop and delete the cluster VMs (disks included)
       community.proxmox.proxmox_kvm:
+        api_host: "{{ pve_auth[item.cluster].api_host }}"
+        api_port: "{{ pve_auth[item.cluster].api_port }}"
+        api_user: "{{ pve_auth[item.cluster].api_user }}"
+        api_token_id: "{{ pve_auth[item.cluster].api_token_id }}"
+        api_token_secret: "{{ pve_auth[item.cluster].api_token_secret }}"
+        validate_certs: "{{ pve_auth[item.cluster].validate_certs }}"
         node: "{{ item.node }}"
         vmid: "{{ item.vmid }}"
         state: absent
         force: true
-      loop: "{{ destroy_vms.json.data | selectattr('name', 'defined') | selectattr('name', 'match', autoscale_vm_name_regex) | list }}"
+      loop: "{{ destroy_targets }}"
       loop_control:
-        label: "{{ item.name }} ({{ item.vmid }})"
+        label: "{{ item.name }} ({{ item.cluster }}/{{ item.vmid }})"
 
-    # ipi: the Redfish emulator also put ISOs in for the masters and workers
+    # Virtual-media ISOs the Redfish emulator uploaded (autoscale, ipi nodes)
     - name: Delete virtual-media ISOs left by the Redfish emulator
       community.proxmox.proxmox_template:
+        api_host: "{{ pve_auth[item.cluster].api_host }}"
+        api_port: "{{ pve_auth[item.cluster].api_port }}"
+        api_user: "{{ pve_auth[item.cluster].api_user }}"
+        api_token_id: "{{ pve_auth[item.cluster].api_token_id }}"
+        api_token_secret: "{{ pve_auth[item.cluster].api_token_secret }}"
+        validate_certs: "{{ pve_auth[item.cluster].validate_certs }}"
         node: "{{ item.node }}"
-        storage: "{{ proxmox_iso_storage }}"
+        storage: "{{ pve_clusters[item.cluster].iso_storage }}"
         content_type: iso
         template: "redfish-vmedia-{{ item.vmid }}.iso"
         state: absent
-      loop: "{{ destroy_vms.json.data | selectattr('name', 'defined') | selectattr('name', 'match', redfish_vm_name_regex) | list }}"
+      loop: "{{ destroy_vms | selectattr('name', 'match', redfish_vm_name_regex) | list }}"
       loop_control:
-        label: "{{ item.vmid }}"
+        label: "{{ item.cluster }}/{{ item.vmid }}"
 
-    - name: Delete virtual-media ISOs of the ipi masters/workers (already deleted above)
+    - name: Delete agent ISO from every Proxmox cluster
       community.proxmox.proxmox_template:
-        node: "{{ item.pve_node }}"
-        storage: "{{ proxmox_iso_storage }}"
-        content_type: iso
-        template: "redfish-vmedia-{{ item.vmid }}.iso"
-        state: absent
-      loop: "{{ ocp_nodes }}"
-      loop_control:
-        label: "{{ item.vmid }}"
-      when: ocp_install_method == 'ipi'
-
-    - name: Delete the ipi provisioner VM
-      community.proxmox.proxmox_kvm:
-        node: "{{ item.node }}"
-        vmid: "{{ item.vmid }}"
-        state: absent
-        force: true
-      loop: "{{ destroy_vms.json.data | selectattr('vmid', 'equalto', ipi_provisioner_vmid | int)
-                | selectattr('name', 'defined') | selectattr('name', 'equalto', ipi_provisioner_name ~ '.' ~ cluster_name) | list }}"
-      loop_control:
-        label: "{{ item.name }} ({{ item.vmid }})"
-
-    - name: Delete agent ISO from Proxmox
-      community.proxmox.proxmox_template:
-        node: "{{ proxmox_iso_node }}"
-        storage: "{{ proxmox_iso_storage }}"
+        api_host: "{{ pve_auth[item.key].api_host }}"
+        api_port: "{{ pve_auth[item.key].api_port }}"
+        api_user: "{{ pve_auth[item.key].api_user }}"
+        api_token_id: "{{ pve_auth[item.key].api_token_id }}"
+        api_token_secret: "{{ pve_auth[item.key].api_token_secret }}"
+        validate_certs: "{{ pve_auth[item.key].validate_certs }}"
+        node: "{{ item.value.node }}"
+        storage: "{{ item.value.storage }}"
         content_type: iso
         template: "{{ agent_iso_name }}"
         state: absent
+      loop: "{{ pve_iso_targets | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
 
     - name: Remove local build state
       ansible.builtin.file:

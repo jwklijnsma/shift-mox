@@ -9,3 +9,6 @@ __pycache__/
 .DS_Store
 .ruff_cache/
 site/
+environments/*/secrets/
+environments/*/vault.yml
+environments/*/vault.yml.*

@@ -2,7 +2,7 @@
    autoscale workers) - what the CCM would do on platform External. #}
 {%- set ns = namespace(lines=[]) -%}
 {%- for n in ocp_nodes + autoscale_pool -%}
-{%-   set ns.lines = ns.lines + [n.name ~ ' ' ~ n.pve_node] -%}
+{%-   set ns.lines = ns.lines + [n.name ~ ' ' ~ proxmox_k8s_regions[n.pve_cluster] ~ ' ' ~ n.pve_node] -%}
 {%- endfor -%}
 apiVersion: v1
 kind: ServiceAccount
@@ -38,7 +38,7 @@ metadata:
   name: proxmox-topology-labels
   namespace: {{ proxmox_csi_namespace }}
 data:
-  # <node name> <Proxmox node>
+  # <node name> <region = Proxmox cluster> <zone = Proxmox node>
   zones: |
 {% for l in ns.lines %}
     {{ l }}
@@ -47,11 +47,11 @@ data:
     #!/bin/bash
     # Label nodes that are missing (or have a wrong) region/zone.
     set -u
-    while read -r name zone; do
+    while read -r name region zone; do
       [ -n "$name" ] || continue
       cur="$(oc get node "$name" -o 'jsonpath={.metadata.labels.topology\.kubernetes\.io/region} {.metadata.labels.topology\.kubernetes\.io/zone}' 2>/dev/null)" || continue
-      [ "$cur" = "$REGION $zone" ] && continue
-      oc label node "$name" "topology.kubernetes.io/region=$REGION" "topology.kubernetes.io/zone=$zone" --overwrite
+      [ "$cur" = "$region $zone" ] && continue
+      oc label node "$name" "topology.kubernetes.io/region=$region" "topology.kubernetes.io/zone=$zone" --overwrite
     done < /config/zones
 ---
 apiVersion: batch/v1
@@ -85,8 +85,6 @@ spec:
               env:
                 - name: HOME
                   value: /tmp
-                - name: REGION
-                  value: {{ proxmox_region | to_json }}
               resources:
                 requests: {cpu: 10m, memory: 64Mi}
                 limits: {memory: 256Mi}

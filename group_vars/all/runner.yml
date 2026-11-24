@@ -4,7 +4,7 @@
 # needs outbound HTTPS to GitHub - no inbound ports anywhere.
 runner_lxc_vmid: 5099
 runner_lxc_hostname: gh-runner
-runner_lxc_pve_node: "{{ proxmox_iso_node }}"
+runner_lxc_pve_node: "{{ proxmox_main_nodes | first | default(proxmox_nodes[0]) }}"   # main Proxmox cluster
 runner_lxc_cores: 2
 runner_lxc_memory: 4096
 runner_lxc_disk_gb: 40

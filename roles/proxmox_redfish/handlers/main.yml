@@ -1,15 +1,18 @@
 ---
 - name: Restart proxmox-redfish
   ansible.builtin.systemd_service:
-    name: proxmox-redfish
+    name: "{{ proxmox_redfish_service }}"
     state: restarted
     daemon_reload: true
 
+# One dnsmasq for every environment on this host; stopped on purpose when no
+# instance needs DHCP any more.
 - name: Restart proxmox-redfish-dhcp
   ansible.builtin.systemd_service:
     name: proxmox-redfish-dhcp
     state: restarted
     daemon_reload: true
+  when: (proxmox_redfish_dhcp_hosts | length > 0) or (proxmox_redfish_dhcp_others.matched | default(0)) > 0
 
 - name: Restart proxmox-redfish-console
   ansible.builtin.systemd_service:
