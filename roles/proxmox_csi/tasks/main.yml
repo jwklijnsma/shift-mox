@@ -53,12 +53,12 @@
           - label
           - node
           - "{{ item.name }}"
-          - topology.kubernetes.io/region={{ proxmox_region }}
+          - topology.kubernetes.io/region={{ proxmox_k8s_regions[item.pve_cluster] }}
           - topology.kubernetes.io/zone={{ item.pve_node }}
           - --overwrite
       loop: "{{ ocp_nodes }}"
       loop_control:
-        label: "{{ item.name }} -> {{ item.pve_node }}"
+        label: "{{ item.name }} -> {{ item.pve_cluster }}/{{ item.pve_node }}"
       register: proxmox_csi_label
       changed_when: proxmox_csi_label.stdout is search('labeled') and proxmox_csi_label.stdout is not search('not labeled')
       failed_when: proxmox_csi_label.rc != 0 and proxmox_csi_label.stderr is not search('NotFound')
@@ -84,12 +84,7 @@
           - { key: node.kubernetes.io/unschedulable, operator: Exists, effect: NoSchedule }
           - { key: node.kubernetes.io/disk-pressure, operator: Exists, effect: NoSchedule }
       config:
-        clusters:
-          - url: "{{ proxmox_k8s_api_url }}"
-            insecure: "{{ proxmox_k8s_insecure | bool }}"
-            token_id: "{{ proxmox_k8s_token_id }}"
-            token_secret: "{{ proxmox_k8s_token_secret }}"
-            region: "{{ proxmox_region }}"
+        clusters: "{{ proxmox_k8s_clusters }}"
       storageClass:
         - name: "{{ proxmox_csi_storage_class }}"
           storage: "{{ proxmox_csi_storage }}"

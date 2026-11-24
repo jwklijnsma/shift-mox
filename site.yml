@@ -30,26 +30,56 @@
           and ipi needs 3 masters.
         quiet: true
 
-    # --- Proxmox API token: checked first, before anything slow happens ------
+    - name: Every placement must name a known Proxmox cluster
+      tags: [always]
+      ansible.builtin.assert:
+        that: _bad | length == 0
+        fail_msg: >-
+          Unknown Proxmox cluster in a placement: {{ _bad | join(', ') }}. Known: {{ pve_clusters.keys() | join(', ') }}.
+          Use "<cluster>/<node>" with a cluster from proxmox_clusters (or a bare node name for {{ proxmox_main_cluster }}).
+        quiet: true
+      vars:
+        _bad: >-
+          {{ ((ocp_nodes + (autoscale_pool if autoscale_enabled | bool else [])) | map(attribute='pve_cluster') | unique)
+             | reject('in', pve_clusters.keys() | list) | list }}
+
+    # --- Proxmox API tokens: checked first, before anything slow happens -----
+    # Once per Proxmox cluster the VMs are on.
     - name: Proxmox API preflight (token and permissions)
       tags: [always]
       ansible.builtin.uri:
-        url: "https://{{ proxmox_api_host }}:{{ proxmox_api_port }}/api2/json/access/permissions?path={{ item.path | urlencode }}"
+        url: "https://{{ _c.api_host }}:{{ _c.api_port }}/api2/json/access/permissions?path={{ item.path | urlencode }}"
         headers:
-          Authorization: "PVEAPIToken={{ proxmox_api_user }}!{{ proxmox_api_token_id }}={{ proxmox_api_token_secret }}"
-        validate_certs: "{{ proxmox_validate_certs }}"
+          Authorization: "PVEAPIToken={{ _c.api_user }}!{{ _c.api_token_id }}={{ _c.api_token_secret }}"
+        validate_certs: "{{ _c.validate_certs }}"
         status_code: [200, 401, 403]
         timeout: 15
       register: _pve
       no_log: true          # the request carries the token secret
       failed_when: false
-      loop:
-        - { path: "/storage/{{ proxmox_iso_storage }}", privs: [Datastore.AllocateTemplate, Datastore.Audit] }
-        - { path: "/storage/{{ proxmox_disk_storage }}", privs: [Datastore.AllocateSpace] }
-        - path: /vms
-          privs: [VM.Allocate, VM.Config.Disk, VM.Config.CDROM, VM.Config.CPU, VM.Config.Memory,
-                  VM.Config.Network, VM.Config.Options, VM.Config.HWType, VM.PowerMgmt]
-        - { path: "/sdn/zones/localnetwork/{{ proxmox_bridge }}", privs: [SDN.Use] }
+      vars:
+        _c: "{{ pve_clusters[item.cluster] }}"
+      loop: >-
+        {%- set ns = namespace(out=[]) -%}
+        {%- for cl in pve_clusters_used -%}
+          {%- set c = pve_clusters[cl] -%}
+          {%- set storages = ocp_nodes | selectattr('pve_cluster', 'equalto', cl) | map(attribute='storage') | unique | list -%}
+          {%- if cl in pve_iso_targets and ocp_install_method != 'ipi' -%}
+            {%- set ns.out = ns.out + [{'cluster': cl, 'path': '/storage/' ~ pve_iso_targets[cl].storage,
+                                        'privs': ['Datastore.AllocateTemplate', 'Datastore.Audit']}] -%}
+          {%- endif -%}
+          {%- for st in (storages or [c.disk_storage]) -%}
+            {%- set ns.out = ns.out + [{'cluster': cl, 'path': '/storage/' ~ st, 'privs': ['Datastore.AllocateSpace']}] -%}
+          {%- endfor -%}
+          {%- set ns.out = ns.out + [
+                {'cluster': cl, 'path': '/vms',
+                 'privs': ['VM.Allocate', 'VM.Config.Disk', 'VM.Config.CDROM', 'VM.Config.CPU', 'VM.Config.Memory',
+                           'VM.Config.Network', 'VM.Config.Options', 'VM.Config.HWType', 'VM.PowerMgmt']},
+                {'cluster': cl, 'path': '/sdn/zones/localnetwork/' ~ c.bridge, 'privs': ['SDN.Use']}] -%}
+        {%- endfor -%}
+        {{ ns.out }}
+      loop_control:
+        label: "{{ item.cluster }}: {{ item.path }}"
 
     - name: Fail on Proxmox API problems
       tags: [always]
@@ -60,20 +90,21 @@
         fail_msg: "{{ _msg }}"
         quiet: true
       vars:
-        _token: "{{ proxmox_api_user }}!{{ proxmox_api_token_id }}"
+        _c: "{{ pve_clusters[r.item.cluster] }}"
+        _token: "{{ _c.api_user }}!{{ _c.api_token_id }}"
         _have: "{{ (r.json.data | default({}))[r.item.path] | default({}) }}"
         _missing: "{{ r.item.privs | reject('in', _have) | list }}"
         _st: "{{ r.status | default(-1) }}"
         _m401: >-
-          Proxmox rejected token {{ _token }} (401): the token does not exist or the secret
-          in group_vars/all/vault.yml is wrong. On the Proxmox node, run `./ocp.sh token`
-          to create a fresh one automatically.
-        _mdown: "Cannot reach the Proxmox API at {{ proxmox_api_host }}:{{ proxmox_api_port }}: {{ r.msg | default('') }}"
-        _mhttp: "Proxmox API returned HTTP {{ _st }} for {{ r.item.path }}."
+          Proxmox cluster {{ r.item.cluster }} rejected token {{ _token }} (401): the token does not
+          exist or its secret is wrong. On a node of that cluster, run `./ocp.sh token` to create a
+          fresh one, and put the secret in vault.yml.
+        _mdown: "Cannot reach the Proxmox API of {{ r.item.cluster }} at {{ _c.api_host }}:{{ _c.api_port }}: {{ r.msg | default('') }}"
+        _mhttp: "Proxmox API of {{ r.item.cluster }} returned HTTP {{ _st }} for {{ r.item.path }}."
         _mpriv: >-
-          Token {{ _token }} is missing {{ _missing | join(', ') }} on {{ r.item.path }}.
-          On the Proxmox node, `./ocp.sh token` sets the right permissions
-          (PVEVMAdmin, PVEDatastoreAdmin, PVESDNUser on /, privsep off).
+          Token {{ _token }} on Proxmox cluster {{ r.item.cluster }} is missing {{ _missing | join(', ') }}
+          on {{ r.item.path }}. On a node of that cluster, `./ocp.sh token` sets the right permissions
+          (PVEVMAdmin, PVEDatastoreAdmin, PVESDNUser, PVEAuditor on /, privsep off).
         _msg: >-
           {{ _m401 if _st | int == 401
              else _mdown if _st | int in [-1, 0]
@@ -82,16 +113,19 @@
       loop: "{{ _pve.results }}"
       loop_control:
         loop_var: r
-        label: "{{ r.item.path }}"
+        label: "{{ r.item.cluster }}: {{ r.item.path }}"
 
-    - name: Get the Proxmox cluster node list
+    - name: Get the node list of every Proxmox cluster
       tags: [always]
       ansible.builtin.uri:
-        url: "https://{{ proxmox_api_host }}:{{ proxmox_api_port }}/api2/json/nodes"
+        url: "https://{{ _c.api_host }}:{{ _c.api_port }}/api2/json/nodes"
         headers:
-          Authorization: "PVEAPIToken={{ proxmox_api_user }}!{{ proxmox_api_token_id }}={{ proxmox_api_token_secret }}"
-        validate_certs: "{{ proxmox_validate_certs }}"
+          Authorization: "PVEAPIToken={{ _c.api_user }}!{{ _c.api_token_id }}={{ _c.api_token_secret }}"
+        validate_certs: "{{ _c.validate_certs }}"
         timeout: 15
+      vars:
+        _c: "{{ pve_clusters[item] }}"
+      loop: "{{ pve_clusters_used }}"
       register: _pve_nodes
       no_log: true
 
@@ -103,23 +137,30 @@
           - _offline | length == 0
           - _iso_local_ok
         fail_msg: >-
-          {{ ('Unknown Proxmox node(s): ' ~ (_unknown | join(', ')) ~ '. This cluster has: '
-              ~ (_known | join(', ')) ~ '. Fix proxmox_nodes / proxmox_iso_node in cluster.yml. ')
+          {{ ('Unknown node(s) on Proxmox cluster ' ~ r.item ~ ': ' ~ (_unknown | join(', ')) ~ '. It has: '
+              ~ (_known | join(', ')) ~ '. Fix proxmox_nodes / node_overrides / iso_node in cluster.yml. ')
              if _unknown | length > 0 else '' }}{{
-             ('Offline node(s): ' ~ (_offline | join(', ')) ~ '. ') if _offline | length > 0 else '' }}{{
-             ('ISO storage "' ~ proxmox_iso_storage ~ '" is local to ' ~ proxmox_iso_node
-              ~ ' but VMs go to ' ~ (_vm_nodes | join(', ')) ~ '. Use shared ISO storage or the same node.')
+             ('Offline node(s) on ' ~ r.item ~ ': ' ~ (_offline | join(', ')) ~ '. ') if _offline | length > 0 else '' }}{{
+             ('ISO storage "local" on ' ~ r.item ~ ' is on ' ~ _iso.node | default('?')
+              ~ ' only, but VMs go to ' ~ (_vm_nodes | join(', ')) ~ '. Use shared ISO storage or the same node.')
              if not _iso_local_ok else '' }}
         quiet: true
       vars:
-        _known: "{{ _pve_nodes.json.data | map(attribute='node') | list }}"
-        _online: "{{ _pve_nodes.json.data | selectattr('status', 'equalto', 'online') | map(attribute='node') | list }}"
-        _vm_nodes: "{{ ocp_nodes | map(attribute='pve_node') | unique | list }}"
-        _wanted: "{{ [proxmox_iso_node] | union(_vm_nodes) | list }}"
+        _iso: "{{ pve_iso_targets[r.item] | default({}) }}"
+        _known: "{{ r.json.data | map(attribute='node') | list }}"
+        _online: "{{ r.json.data | selectattr('status', 'equalto', 'online') | map(attribute='node') | list }}"
+        _vm_nodes: "{{ ocp_nodes | selectattr('pve_cluster', 'equalto', r.item) | map(attribute='pve_node') | unique | list }}"
+        _wanted: "{{ ([_iso.node] if _iso.node is defined else []) | union(_vm_nodes) | list }}"
         _unknown: "{{ _wanted | reject('in', _known) | list }}"
         _offline: "{{ _wanted | select('in', _known) | reject('in', _online) | list }}"
         # "local" is per node; any other storage name is assumed to be shared
-        _iso_local_ok: "{{ proxmox_iso_storage != 'local' or _vm_nodes == [proxmox_iso_node] }}"
+        _iso_local_ok: >-
+          {{ ocp_install_method == 'ipi' or _iso.storage | default('') != 'local'
+             or _vm_nodes | length == 0 or _vm_nodes == [_iso.node] }}
+      loop: "{{ _pve_nodes.results }}"
+      loop_control:
+        loop_var: r
+        label: "{{ r.item }}"
 
     # Storage, bridge, VMIDs, sizes, IPs, pull secret, SSH key against reality
     - name: Check cluster.yml against the real Proxmox cluster

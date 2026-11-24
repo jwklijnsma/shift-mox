@@ -31,6 +31,19 @@
           has no Machine API; there the Proxmox CCM removes nodes whose VM is gone.
         quiet: true
       tags: [always]
+    - name: Autoscale slots must be on known Proxmox clusters (kubemox only on the main one)
+      ansible.builtin.assert:
+        that:
+          - _clusters | reject('in', pve_clusters.keys() | list) | list | length == 0
+          - autoscale_vm_provisioning == 'on_demand' or _clusters | reject('equalto', proxmox_main_cluster) | list | length == 0
+        fail_msg: >-
+          autoscale_proxmox_nodes places slots on {{ _clusters | join(', ') }}; known clusters:
+          {{ pve_clusters.keys() | join(', ') }}. kubemox (autoscale_vm_provisioning: kubemox) only
+          works with the main Proxmox cluster - use on_demand for other clusters.
+        quiet: true
+      vars:
+        _clusters: "{{ autoscale_pool | map(attribute='pve_cluster') | unique | list }}"
+      tags: [always]
     - name: Tools (oc)
       ansible.builtin.include_role:
         name: tools

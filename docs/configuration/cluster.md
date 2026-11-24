@@ -76,10 +76,13 @@ hands them to the installer, so Calico runs from the first boot.
 | `proxmox_api_host` / `_port` | — / `8006` | Proxmox API (`ocp.sh` uses `127.0.0.1` on the host) |
 | `proxmox_api_user` / `_token_id` | `ansible@pve` / `ocp` | API token; the secret is in `vault.yml` |
 | `proxmox_validate_certs` | `false` | check the API certificate (set `true` with a real cert) |
-| `proxmox_iso_node` | first of `proxmox_nodes` | node that receives the ISO |
+| `proxmox_iso_node` | `""` = first VM node | node that receives the ISO |
 | `proxmox_iso_storage` | `local` | storage for ISOs |
 | `proxmox_disk_storage` | `local-zfs` | storage for VM disks |
 | `proxmox_bridge` / `proxmox_vlan` | `vmbr1` / `""` | network for the VMs |
+| `proxmox_clusters` | `{}` | more, independent Proxmox clusters — see [Several Proxmox clusters](multi-proxmox.md) |
+
+To run several clusters from one checkout, see [Environments](environments.md).
 
 ## Nodes — generated automatically
 
@@ -90,7 +93,7 @@ ocp_master_count: 3       # 1 = SNO, 3 = compact / standard
 ocp_worker_count: 2
 vmid_start: 5100
 ip_start: 192.168.50.21
-proxmox_nodes: [node02]   # e.g. [pve01, pve02, pve03]
+proxmox_nodes: [node02]   # e.g. [pve01, pve02, pve03] or [node02, site2/pve11]
 master_size: { cores: 8, memory: 24576, disk_gb: 120 }
 worker_size: { cores: 8, memory: 16384, disk_gb: 120 }
 ```

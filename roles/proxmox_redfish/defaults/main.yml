@@ -1,6 +1,17 @@
 ---
 proxmox_redfish_dir: /opt/proxmox-redfish
-proxmox_redfish_conf_dir: /etc/proxmox-redfish
+# One emulator per environment (./ocp.sh -E <env>) can share a host: each gets
+# its own service, config dir and port. Without an environment the names stay
+# proxmox-redfish / /etc/proxmox-redfish.
+proxmox_redfish_instance: "{{ shiftmox_env | default('', true) }}"
+proxmox_redfish_suffix: "{{ ('-' ~ proxmox_redfish_instance) if proxmox_redfish_instance | length > 0 else '' }}"
+proxmox_redfish_service: "proxmox-redfish{{ proxmox_redfish_suffix }}"
+proxmox_redfish_conf_dir: "/etc/proxmox-redfish{{ proxmox_redfish_suffix }}"
+proxmox_redfish_tmp_dir: "{{ proxmox_redfish_dir }}/tmp{{ proxmox_redfish_suffix }}"
+# DHCP is one dnsmasq for all instances on the host (port 67 can't be shared):
+# each instance drops its static leases into this directory.
+proxmox_redfish_dhcp_dir: /etc/proxmox-redfish-dhcp.d
+proxmox_redfish_dhcp_tag: "sm-{{ proxmox_redfish_instance | default('default', true) }}"
 proxmox_redfish_user: proxmox-redfish
 proxmox_redfish_sushy_version: "2.2.0"
 # production WSGI server (>= 27 for --no-control-socket)
@@ -10,11 +21,30 @@ proxmox_redfish_slots: >-
   {%- set ns = namespace(out=[]) -%}
   {%- if autoscale_vm_provisioning == 'on_demand' -%}
   {%-   for h in autoscale_pool -%}
-  {%-     set ns.out = ns.out + [{'name': h.name, 'vm_name': h.vm_name, 'pve_node': h.pve_node,
+  {%-     set ns.out = ns.out + [{'name': h.name, 'vm_name': h.vm_name,
+            'pve_cluster': h.pve_cluster, 'pve_node': h.pve_node,
             'cores': h.cores, 'memory': h.memory, 'disk_gb': h.disk_gb, 'mac': h.mac,
-            'storage': proxmox_disk_storage, 'bridge': proxmox_bridge, 'vlan': proxmox_vlan | default('') | string}] -%}
+            'storage': h.storage, 'bridge': h.bridge, 'vlan': h.vlan}] -%}
   {%-   endfor -%}
   {%- endif -%}
+  {{ ns.out }}
+# Proxmox clusters the emulator talks to: every cluster the cluster's VMs or
+# autoscale slots are on. Main uses the autoscale token (and API host override).
+proxmox_redfish_clusters: >-
+  {%- set used = (pve_clusters_used + (autoscale_pool | map(attribute='pve_cluster') | list)) | unique | list -%}
+  {%- set ns = namespace(out={}) -%}
+  {%- for cl in used if cl in pve_clusters -%}
+    {%- set c = pve_clusters[cl] -%}
+    {%- set main = cl == proxmox_main_cluster -%}
+    {%- set ns.out = ns.out | combine({cl: {
+          'host': autoscale_proxmox_api_host if main else c.api_host,
+          'port': c.api_port | int,
+          'token_user': autoscale_proxmox_token_user if main else c.api_user,
+          'token_name': autoscale_proxmox_token_id if main else c.api_token_id,
+          'token_secret': autoscale_proxmox_token_secret if main else c.api_token_secret,
+          'verify_ssl': (autoscale_proxmox_validate_certs if main else c.validate_certs) | bool,
+          'iso_storage': c.iso_storage}}) -%}
+  {%- endfor -%}
   {{ ns.out }}
 # Read-only token for listing BareMetalHosts (set by autoscale.yml's first play)
 proxmox_redfish_k8s_token: "{{ hostvars['localhost']['ocp_autoscale_bmc_k8s_token'] | default('') }}"

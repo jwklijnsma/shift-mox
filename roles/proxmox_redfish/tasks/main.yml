@@ -27,7 +27,7 @@
     mode: "{{ item.mode }}"
   loop:
     - { path: "{{ proxmox_redfish_dir }}", owner: root, mode: "0755" }
-    - { path: "{{ proxmox_redfish_dir }}/tmp", owner: "{{ proxmox_redfish_user }}", mode: "0750" }
+    - { path: "{{ proxmox_redfish_tmp_dir }}", owner: "{{ proxmox_redfish_user }}", mode: "0750" }
     - { path: "{{ proxmox_redfish_conf_dir }}", owner: root, mode: "0750" }
 
 - name: Python venv with sushy-tools and proxmoxer
@@ -86,6 +86,35 @@
   no_log: true
   notify: Restart proxmox-redfish
 
+# Several environments can share this host; each emulator needs its own port.
+- name: Emulators of other environments on this host
+  ansible.builtin.shell: |
+    set -o pipefail
+    for f in /etc/proxmox-redfish*/emulator.conf; do
+      [ -f "$f" ] && [ "$f" != "{{ proxmox_redfish_conf_dir }}/emulator.conf" ] || continue
+      ip=$(sed -nE 's/^SUSHY_EMULATOR_LISTEN_IP = "(.*)"/\1/p' "$f")
+      port=$(sed -nE 's/^SUSHY_EMULATOR_LISTEN_PORT = ([0-9]+)/\1/p' "$f")
+      echo "$(dirname "$f") $ip $port"
+    done
+  args:
+    executable: /bin/bash
+  register: proxmox_redfish_others
+  changed_when: false
+
+- name: The port must not be taken by another environment's emulator
+  ansible.builtin.assert:
+    that: _clash | length == 0
+    fail_msg: >-
+      {{ redfish_bmc_address }}:{{ redfish_bmc_port }} is already used by the emulator in
+      {{ _clash | map('split', ' ') | map('first') | join(', ') }}. Give this environment its own
+      redfish_bmc_port (e.g. 8444) in its cluster.yml.
+    quiet: true
+  vars:
+    _clash: >-
+      {{ proxmox_redfish_others.stdout_lines
+         | select('search', ' (' ~ (redfish_bmc_address | regex_escape) ~ '|0\.0\.0\.0) ' ~ redfish_bmc_port ~ '$')
+         | list }}
+
 # site.yml (install_method ipi) also deploys the emulator, without asking the
 # cluster for a token: keep the one autoscale.yml stored earlier, so the
 # reaper keeps working after a re-run of site.yml.
@@ -127,13 +156,13 @@
 - name: Systemd unit
   ansible.builtin.template:
     src: proxmox-redfish.service.j2
-    dest: /etc/systemd/system/proxmox-redfish.service
+    dest: "/etc/systemd/system/{{ proxmox_redfish_service }}.service"
     mode: "0644"
   notify: Restart proxmox-redfish
 
 - name: Enable and start
   ansible.builtin.systemd_service:
-    name: proxmox-redfish
+    name: "{{ proxmox_redfish_service }}"
     enabled: true
     state: started
     daemon_reload: true
@@ -142,6 +171,7 @@
   ansible.builtin.meta: flush_handlers
 
 # --- DHCP: static leases for the autoscale slots (and ipi nodes in dhcp mode) --
+# One shared dnsmasq per host; this instance only owns its file in the conf dir.
 - name: DHCP for the autoscale slots
   when: proxmox_redfish_dhcp_hosts | length > 0
   block:
@@ -149,11 +179,23 @@
       ansible.builtin.package:
         name: "{{ 'dnsmasq-base' if ansible_os_family == 'Debian' else 'dnsmasq' }}"
 
-    - name: DHCP config (static leases for the slot MACs only)
+    - name: DHCP config directory
+      ansible.builtin.file:
+        path: "{{ proxmox_redfish_dhcp_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: DHCP config (shared part, range per listen address, this instance's leases)
       ansible.builtin.template:
-        src: dhcp.conf.j2
-        dest: "{{ proxmox_redfish_conf_dir }}/dhcp.conf"
+        src: "{{ item.src }}"
+        dest: "{{ proxmox_redfish_dhcp_dir }}/{{ item.dest }}"
         mode: "0644"
+      loop:
+        - { src: dhcp-base.conf.j2, dest: 00-base.conf }
+        - { src: dhcp-range.conf.j2, dest: "10-range-{{ redfish_bmc_address }}.conf" }
+        - { src: dhcp.conf.j2, dest: "50-{{ proxmox_redfish_dhcp_tag }}.conf" }
+      loop_control:
+        label: "{{ item.dest }}"
       notify: Restart proxmox-redfish-dhcp
 
     - name: DHCP systemd unit
@@ -170,13 +212,33 @@
         state: started
         daemon_reload: true
 
-- name: No DHCP for the autoscale slots
-  ansible.builtin.systemd_service:
-    name: proxmox-redfish-dhcp
-    enabled: false
-    state: stopped
+- name: Old single-instance DHCP config
+  ansible.builtin.file:
+    path: "{{ proxmox_redfish_conf_dir }}/dhcp.conf"
+    state: absent
+
+- name: No DHCP for this instance
   when: proxmox_redfish_dhcp_hosts | length == 0
-  failed_when: false
+  block:
+    - name: Remove this instance's leases
+      ansible.builtin.file:
+        path: "{{ proxmox_redfish_dhcp_dir }}/50-{{ proxmox_redfish_dhcp_tag }}.conf"
+        state: absent
+      notify: Restart proxmox-redfish-dhcp
+
+    - name: Leases of other instances
+      ansible.builtin.find:
+        paths: "{{ proxmox_redfish_dhcp_dir }}"
+        patterns: "50-*.conf"
+      register: proxmox_redfish_dhcp_others
+
+    - name: Stop DHCP when no instance needs it
+      ansible.builtin.systemd_service:
+        name: proxmox-redfish-dhcp
+        enabled: false
+        state: stopped
+      when: proxmox_redfish_dhcp_others.matched == 0
+      failed_when: false
 
 - name: Apply DHCP restarts now
   ansible.builtin.meta: flush_handlers

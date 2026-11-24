@@ -23,10 +23,14 @@ on:
         description: "For destroy: type the cluster name"
         type: string
         default: ""
+      environment:
+        description: "Shiftmox environment (environments/<name>/); empty = group_vars/all/cluster.yml"
+        type: string
+        default: ""
 
 # One run at a time per repo - two installers on the same state dir would collide.
 concurrency:
-  group: openshift-proxmox
+  group: openshift-proxmox-${{ inputs.environment || 'default' }}
   cancel-in-progress: false
 
 permissions:
@@ -34,14 +38,16 @@ permissions:
 
 jobs:
   run:
-    name: ${{ inputs.action }} (${{ inputs.stage }})
+    name: ${{ inputs.action }} (${{ inputs.stage }})${{ inputs.environment && format(' - {0}', inputs.environment) || '' }}
     runs-on: [self-hosted, linux, proxmox]
-    # Secrets live in the "proxmox" environment; add required reviewers there
-    # if you want an approval click before every deploy/destroy.
-    environment: proxmox
+    # Secrets live in the GitHub environment "proxmox" (or "proxmox-<env>" for
+    # a Shiftmox environment); add required reviewers there if you want an
+    # approval click before every deploy/destroy.
+    environment: ${{ inputs.environment && format('proxmox-{0}', inputs.environment) || 'proxmox' }}
     timeout-minutes: 240
     env:
       OCP_STATE_DIR: /var/lib/ocp-deploy
+      SHIFTMOX_ENV: ${{ inputs.environment }}
       ANSIBLE_FORCE_COLOR: "1"
     steps:
       - name: Checkout
@@ -63,17 +69,31 @@ jobs:
           OCP_SSH_PUBKEY: ${{ secrets.OCP_SSH_PUBKEY }}
           ANSIBLE_VAULT_PASSWORD: ${{ secrets.ANSIBLE_VAULT_PASSWORD }}
           REDFISH_BMC_PASSWORD: ${{ secrets.REDFISH_BMC_PASSWORD }}
+          # Optional JSON object with more variables, e.g. the token secrets of
+          # extra Proxmox clusters: {"vault_site2_token_secret": "..."}
+          SHIFTMOX_EXTRA_VARS: ${{ secrets.SHIFTMOX_EXTRA_VARS }}
           # Optional repo variable: API address as seen from the runner LXC
           PROXMOX_API_HOST: ${{ vars.PROXMOX_API_HOST }}
         run: |
           set -euo pipefail
           umask 077
           d="$RUNNER_TEMP/ocp-secrets"; mkdir -p "$d"
+          envargs=()
+          if [ -n "$SHIFTMOX_ENV" ]; then
+            [[ "$SHIFTMOX_ENV" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || { echo "::error::bad environment name"; exit 1; }
+            [ -f "environments/$SHIFTMOX_ENV/cluster.yml" ] || { echo "::error::environments/$SHIFTMOX_ENV/cluster.yml not found"; exit 1; }
+            envargs=(-e "shiftmox_env=$SHIFTMOX_ENV" -e "@environments/$SHIFTMOX_ENV/cluster.yml")
+          fi
+          printf '%s\n' "${envargs[@]}" > "$d/env-args"
           for v in PROXMOX_API_TOKEN_SECRET OCP_SSH_PUBKEY; do
             [ -n "${!v}" ] || { echo "::error::Secret $v is not set in the 'proxmox' environment"; exit 1; }
           done
           # Pull secret: required for OpenShift, not used for OKD
-          if grep -qE '^ocp_distribution:[[:space:]]*"?okd' group_vars/all/cluster.yml; then
+          dist=""
+          for f in ${SHIFTMOX_ENV:+"environments/$SHIFTMOX_ENV/cluster.yml"} group_vars/all/cluster.yml; do
+            [ -n "$dist" ] || dist="$(sed -nE 's/^ocp_distribution:[[:space:]]*"?([a-z]+).*/\1/p' "$f" | head -1)"
+          done
+          if [ "$dist" = okd ]; then
             echo "OKD: no pull secret needed"
           else
             [ -n "$OCP_PULL_SECRET" ] || { echo "::error::Secret OCP_PULL_SECRET is not set (needed for OpenShift; not for OKD)"; exit 1; }
@@ -89,8 +109,11 @@ jobs:
               "proxmox_api_token_secret": os.environ["PROXMOX_API_TOKEN_SECRET"],
               "pull_secret_file": f"{d}/pull-secret.json",
               "ssh_pubkey_file": f"{d}/id.pub",
-              "ocp_state_dir": os.environ["OCP_STATE_DIR"],
+              "ocp_state_dir": os.environ["OCP_STATE_DIR"]
+                               + (f"/env/{os.environ['SHIFTMOX_ENV']}" if os.environ.get("SHIFTMOX_ENV") else ""),
           }
+          if os.environ.get("SHIFTMOX_EXTRA_VARS"):
+              v.update(json.loads(os.environ["SHIFTMOX_EXTRA_VARS"]))
           if os.environ.get("REDFISH_BMC_PASSWORD"):
               v["redfish_bmc_password"] = os.environ["REDFISH_BMC_PASSWORD"]
           if os.environ.get("PROXMOX_API_HOST"):
@@ -103,6 +126,7 @@ jobs:
             echo "ANSIBLE_VAULT_PASSWORD_FILE=$d/vault-pass" >> "$GITHUB_ENV"
           fi
           echo "CI_VARS=$d/ci-vars.json" >> "$GITHUB_ENV"
+          echo "ENV_ARGS_FILE=$d/env-args" >> "$GITHUB_ENV"
 
       - name: Deploy
         if: inputs.action == 'deploy'
@@ -112,23 +136,27 @@ jobs:
           REBUILD: ${{ inputs.rebuild_iso }}
         run: |
           set -euo pipefail
+          mapfile -t envargs < "$ENV_ARGS_FILE"
           if [ "$STAGE" = "autoscale" ]; then
             # The runner user can't install system services, so the Redfish
             # emulator (tag bmc) is installed once from your machine:
             #   ansible-playbook autoscale.yml --tags bmc
             # with the same redfish_bmc_password as the REDFISH_BMC_PASSWORD secret.
             [ -n "${REDFISH_BMC_PASSWORD:-}" ] || { echo "::error::Secret REDFISH_BMC_PASSWORD is not set (must match the emulator's password)"; exit 1; }
-            exec ansible-playbook autoscale.yml -e "@$CI_VARS" --skip-tags bmc
+            exec ansible-playbook autoscale.yml "${envargs[@]}" -e "@$CI_VARS" --skip-tags bmc
           fi
           tags=()
           [ "$STAGE" != "all" ] && tags=(--tags "$STAGE")
-          ansible-playbook site.yml -e "@$CI_VARS" -e "agent_iso_rebuild=$REBUILD" "${tags[@]}"
+          ansible-playbook site.yml "${envargs[@]}" -e "@$CI_VARS" -e "agent_iso_rebuild=$REBUILD" "${tags[@]}"
 
       - name: Destroy
         if: inputs.action == 'destroy'
         env:
           CONFIRM: ${{ inputs.confirm }}
-        run: ansible-playbook destroy.yml -e "@$CI_VARS" -e "confirm_destroy=$CONFIRM"
+        run: |
+          set -euo pipefail
+          mapfile -t envargs < "$ENV_ARGS_FILE"
+          ansible-playbook destroy.yml "${envargs[@]}" -e "@$CI_VARS" -e "confirm_destroy=$CONFIRM"
 
       - name: Remove secrets
         if: always()

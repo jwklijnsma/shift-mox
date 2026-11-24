@@ -12,6 +12,8 @@ group_vars/all/
   cluster.yml                         <- the cluster (edit this)
   autoscale.yml                       <- autoscaling settings
   install.yml                         <- ipi / external / CCM / CSI settings
+environments/<name>/                  <- one cluster: cluster.yml, vault.yml, secrets/
+tests/                                <- unit tests of the Redfish driver (pytest)
   runner.yml                          <- runner LXC
   vault.yml(.example)                 <- secrets (ansible-vault)
   derived.yml                         computed values (generated nodes, slots, ...)

@@ -1,10 +1,20 @@
 ---
+# One upload per Proxmox cluster the VMs are on (pve_iso_targets).
 - name: Upload agent ISO to Proxmox storage
   community.proxmox.proxmox_template:
-    node: "{{ proxmox_iso_node }}"
-    storage: "{{ proxmox_iso_storage }}"
+    api_host: "{{ pve_auth[item.key].api_host }}"
+    api_port: "{{ pve_auth[item.key].api_port }}"
+    api_user: "{{ pve_auth[item.key].api_user }}"
+    api_token_id: "{{ pve_auth[item.key].api_token_id }}"
+    api_token_secret: "{{ pve_auth[item.key].api_token_secret }}"
+    validate_certs: "{{ pve_auth[item.key].validate_certs }}"
+    node: "{{ item.value.node }}"
+    storage: "{{ item.value.storage }}"
     content_type: iso
     src: "{{ work_dir }}/{{ agent_iso_name }}"
     timeout: 900
     force: "{{ agent_iso_rebuild | default(false) | bool }}"
     state: present
+  loop: "{{ pve_iso_targets | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}: {{ item.value.storage }} on {{ item.value.node }}"

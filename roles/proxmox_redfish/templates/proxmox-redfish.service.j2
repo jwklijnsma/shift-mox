@@ -1,5 +1,5 @@
 [Unit]
-Description=Redfish BMC emulator for Proxmox VE VMs (OpenShift Metal3 autoscaling)
+Description=Redfish BMC emulator for Proxmox VE VMs (OpenShift Metal3){{ (' - ' ~ proxmox_redfish_instance) if proxmox_redfish_instance | length > 0 else '' }}
 After=network-online.target
 Wants=network-online.target
 
@@ -7,7 +7,7 @@ Wants=network-online.target
 User={{ proxmox_redfish_user }}
 Group={{ proxmox_redfish_user }}
 WorkingDirectory={{ proxmox_redfish_dir }}
-Environment=TMPDIR={{ proxmox_redfish_dir }}/tmp
+Environment=TMPDIR={{ proxmox_redfish_tmp_dir }}
 Environment=SUSHY_EMULATOR_CONFIG={{ proxmox_redfish_conf_dir }}/emulator.conf
 # Production WSGI server. One worker process on purpose (in-process VM cache
 # and reaper thread); threads serve Ironic's parallel requests. A virtual
@@ -20,7 +20,7 @@ ExecStart={{ proxmox_redfish_dir }}/venv/bin/gunicorn \
     --certfile {{ proxmox_redfish_conf_dir }}/tls.crt \
     --keyfile {{ proxmox_redfish_conf_dir }}/tls.key \
     --timeout 120 --graceful-timeout 30 --no-control-socket \
-    --worker-tmp-dir {{ proxmox_redfish_dir }}/tmp \
+    --worker-tmp-dir {{ proxmox_redfish_tmp_dir }} \
     --access-logfile - --error-logfile - \
     proxmox_redfish:app
 Restart=on-failure
@@ -28,7 +28,7 @@ RestartSec=5
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths={{ proxmox_redfish_dir }}/tmp
+ReadWritePaths={{ proxmox_redfish_tmp_dir }}
 PrivateTmp=true
 
 [Install]

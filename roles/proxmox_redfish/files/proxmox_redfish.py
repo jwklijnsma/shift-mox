@@ -20,18 +20,23 @@ the OpenShift API can't be asked, nothing is deleted.
 Only VMs whose name matches SUSHY_PROXMOX_NAME_REGEX are visible, so the
 emulator can't touch the control plane or unrelated VMs.
 
+Several independent Proxmox clusters (SUSHY_PROXMOX_CLUSTERS): every VM is
+looked up in all of them, and each slot says on which cluster its VM is
+created (slot "pve_cluster"). A cluster that can't be reached keeps its last
+known VM list, so its machines don't vanish from Ironic.
+
 Runs under gunicorn (see the systemd unit); the config file comes from
 SUSHY_EMULATOR_CONFIG. Config (python file, sushy-tools style):
-    SUSHY_PROXMOX_HOST            Proxmox API host
-    SUSHY_PROXMOX_PORT            8006
-    SUSHY_PROXMOX_TOKEN_USER      e.g. ansible@pve
-    SUSHY_PROXMOX_TOKEN_NAME      e.g. ocp
-    SUSHY_PROXMOX_TOKEN_SECRET    token secret
-    SUSHY_PROXMOX_VERIFY_SSL      True/False
-    SUSHY_PROXMOX_ISO_STORAGE     storage with content "iso" (virtual media)
+    SUSHY_PROXMOX_CLUSTERS        dict name -> {host, port, token_user,
+                                  token_name, token_secret, verify_ssl,
+                                  iso_storage (content "iso", virtual media)}
+    SUSHY_PROXMOX_DEFAULT_CLUSTER name used for slots without pve_cluster
+    (single cluster, older configs: SUSHY_PROXMOX_HOST, _PORT, _TOKEN_USER,
+     _TOKEN_NAME, _TOKEN_SECRET, _VERIFY_SSL, _ISO_STORAGE)
     SUSHY_PROXMOX_NAME_REGEX      which VMs are exposed, e.g. ^worker-auto-\\d+\\.ocp5$
-    SUSHY_PROXMOX_SLOTS           list of dicts: name, vm_name, pve_node, cores,
-                                  memory (MB), disk_gb, mac, storage, bridge, vlan
+    SUSHY_PROXMOX_SLOTS           list of dicts: name, vm_name, pve_cluster,
+                                  pve_node, cores, memory (MB), disk_gb, mac,
+                                  storage, bridge, vlan
     SUSHY_PROXMOX_DELETE_GRACE    seconds a released VM must be off (default 300)
     SUSHY_K8S_API                 https://<api>:6443 (for the reaper)
     SUSHY_K8S_TOKEN               token that may list BareMetalHosts
@@ -72,16 +77,27 @@ class ProxmoxDriver(AbstractSystemsDriver):
 
     def __init__(self):
         cfg = self._config
-        self._api = ProxmoxAPI(
-            cfg["SUSHY_PROXMOX_HOST"],
-            port=int(cfg.get("SUSHY_PROXMOX_PORT", 8006)),
-            user=cfg["SUSHY_PROXMOX_TOKEN_USER"],
-            token_name=cfg["SUSHY_PROXMOX_TOKEN_NAME"],
-            token_value=cfg["SUSHY_PROXMOX_TOKEN_SECRET"],
-            verify_ssl=bool(cfg.get("SUSHY_PROXMOX_VERIFY_SSL", True)),
-            timeout=120,
-        )
-        self._iso_storage = cfg.get("SUSHY_PROXMOX_ISO_STORAGE", "local")
+        clusters = cfg.get("SUSHY_PROXMOX_CLUSTERS") or {"main": {
+            "host": cfg["SUSHY_PROXMOX_HOST"],
+            "port": cfg.get("SUSHY_PROXMOX_PORT", 8006),
+            "token_user": cfg["SUSHY_PROXMOX_TOKEN_USER"],
+            "token_name": cfg["SUSHY_PROXMOX_TOKEN_NAME"],
+            "token_secret": cfg["SUSHY_PROXMOX_TOKEN_SECRET"],
+            "verify_ssl": cfg.get("SUSHY_PROXMOX_VERIFY_SSL", True),
+            "iso_storage": cfg.get("SUSHY_PROXMOX_ISO_STORAGE", "local"),
+        }}
+        self._default = cfg.get("SUSHY_PROXMOX_DEFAULT_CLUSTER") or next(iter(clusters))
+        self._clusters = {
+            name: {
+                "api": ProxmoxAPI(
+                    c["host"], port=int(c.get("port", 8006)),
+                    user=c["token_user"], token_name=c["token_name"],
+                    token_value=c["token_secret"],
+                    verify_ssl=bool(c.get("verify_ssl", True)), timeout=120),
+                "iso_storage": c.get("iso_storage", "local"),
+            }
+            for name, c in clusters.items()
+        }
         self._name_re = re.compile(cfg["SUSHY_PROXMOX_NAME_REGEX"])
         self._slots = {s["vm_name"]: s for s in cfg.get("SUSHY_PROXMOX_SLOTS") or []}
         self._grace = int(cfg.get("SUSHY_PROXMOX_DELETE_GRACE", 300))
@@ -91,6 +107,7 @@ class ProxmoxDriver(AbstractSystemsDriver):
         self._lock = threading.Lock()
         self._create_locks = {n: threading.Lock() for n in self._slots}
         self._vms = []
+        self._vms_by_cluster = {}
         self._vms_at = 0.0
         self._created = {}
         self._uuids = {}
@@ -103,12 +120,18 @@ class ProxmoxDriver(AbstractSystemsDriver):
     def _list(self):
         with self._lock:
             if time.time() - self._vms_at > _CACHE_TTL:
-                res = self._api.cluster.resources.get(type="vm")
-                self._vms = [
-                    v for v in res
-                    if v.get("type") == "qemu" and not v.get("template")
-                    and self._name_re.search(v.get("name", ""))
-                ]
+                for cname, c in self._clusters.items():
+                    try:
+                        res = c["api"].cluster.resources.get(type="vm")
+                    except Exception as exc:  # noqa: BLE001 - keep last known list
+                        self._logger.warning("Proxmox cluster %s unreachable: %s", cname, exc)
+                        continue
+                    self._vms_by_cluster[cname] = [
+                        dict(v, cluster=cname) for v in res
+                        if v.get("type") == "qemu" and not v.get("template")
+                        and self._name_re.search(v.get("name", ""))
+                    ]
+                self._vms = [v for vs in self._vms_by_cluster.values() for v in vs]
                 self._vms_at = time.time()
             # A VM we just created shows up in cluster/resources only after a
             # few seconds; until then use what we know, so nobody sees the
@@ -126,7 +149,21 @@ class ProxmoxDriver(AbstractSystemsDriver):
     def _virtual(self, slot):
         """A slot without a VM: looks like a powered-off machine."""
         return {"vmid": None, "name": slot["vm_name"], "node": slot["pve_node"],
-                "slot": slot}
+                "cluster": self._cluster_of_slot(slot), "slot": slot}
+
+    def _cluster_of_slot(self, slot):
+        return slot.get("pve_cluster") or self._default
+
+    def _api_of(self, v):
+        """Proxmox API of the cluster a VM (or slot) lives on."""
+        return self._clusters[v.get("cluster") or self._default]["api"]
+
+    def _iso_storage_of(self, v):
+        return self._clusters[v.get("cluster") or self._default]["iso_storage"]
+
+    @staticmethod
+    def _key(v):
+        return (v.get("cluster"), v["vmid"])
 
     def _vm(self, identity):
         """Find a VM (or VM-less slot) by UUID, name or VMID."""
@@ -145,7 +182,7 @@ class ProxmoxDriver(AbstractSystemsDriver):
         raise error.NotFound(f"No Proxmox VM matches system {identity}")
 
     def _qemu(self, v):
-        return self._api.nodes(v["node"]).qemu(v["vmid"])
+        return self._api_of(v).nodes(v["node"]).qemu(v["vmid"])
 
     def _slot_config(self, slot):
         """What the VM's config will look like once it is created."""
@@ -187,16 +224,18 @@ class ProxmoxDriver(AbstractSystemsDriver):
     def _uuid_of(self, v):
         if v["vmid"] is None:
             return slot_uuid(v["name"])
-        if v["vmid"] not in self._uuids:
+        key = self._key(v)
+        if key not in self._uuids:
             smbios = self._config_of(v).get("smbios1", "")
             m = re.search(r"uuid=([0-9a-fA-F-]{36})", smbios)
-            self._uuids[v["vmid"]] = (
+            self._uuids[key] = (
                 m.group(1).lower() if m else
-                str(uuidlib.uuid5(uuidlib.NAMESPACE_URL, f"proxmox-vm-{v['vmid']}")))
-        return self._uuids[v["vmid"]]
+                str(uuidlib.uuid5(uuidlib.NAMESPACE_URL,
+                                  f"proxmox-vm-{v.get('cluster')}-{v['vmid']}")))
+        return self._uuids[key]
 
     def _wait(self, v, upid, timeout=600):
-        node = self._api.nodes(v["node"])
+        node = self._api_of(v).nodes(v["node"])
         end = time.time() + timeout
         while time.time() < end:
             st = node.tasks(upid).status.get()
@@ -219,14 +258,17 @@ class ProxmoxDriver(AbstractSystemsDriver):
             v = self._vm(identity)          # someone else may have created it
             if v["vmid"] is not None:
                 return v
-            node = self._api.nodes(slot["pve_node"])
-            vmid = int(self._api.cluster.nextid.get())
-            self._logger.info("Creating VM %s (%s) on %s for slot %s", vmid,
-                              slot["vm_name"], slot["pve_node"], slot["name"])
+            cluster = self._cluster_of_slot(slot)
+            api = self._clusters[cluster]["api"]
+            node = api.nodes(slot["pve_node"])
+            vmid = int(api.cluster.nextid.get())
+            self._logger.info("Creating VM %s (%s) on %s/%s for slot %s", vmid,
+                              slot["vm_name"], cluster, slot["pve_node"], slot["name"])
             upid = node.qemu.post(vmid=vmid, **self._slot_config(slot))
-            self._wait({"node": slot["pve_node"]}, upid, timeout=900)
+            self._wait({"node": slot["pve_node"], "cluster": cluster}, upid, timeout=900)
             created = {"vmid": vmid, "node": slot["pve_node"], "name": slot["vm_name"],
-                       "type": "qemu", "status": "stopped", "created": time.time()}
+                       "cluster": cluster, "type": "qemu", "status": "stopped",
+                       "created": time.time()}
             with self._lock:
                 self._created[slot["vm_name"]] = created
             self._invalidate()
@@ -236,13 +278,14 @@ class ProxmoxDriver(AbstractSystemsDriver):
     def _delete_vm(self, v):
         self._logger.info("Deleting released VM %s (%s)", v["vmid"], v["name"])
         self._wait(v, self._qemu(v).delete(purge=1, **{"destroy-unreferenced-disks": 1}))
-        volid = f"{self._iso_storage}:iso/{self._iso_name(v)}"
+        iso_storage = self._iso_storage_of(v)
+        volid = f"{iso_storage}:iso/{self._iso_name(v)}"
         try:
-            self._wait(v, self._api.nodes(v["node"]).storage(
-                self._iso_storage).content(volid).delete())
+            self._wait(v, self._api_of(v).nodes(v["node"]).storage(
+                iso_storage).content(volid).delete())
         except Exception as exc:  # noqa: BLE001 - usually: no ISO left
             self._logger.debug("No ISO %s to remove: %s", volid, exc)
-        self._uuids.pop(v["vmid"], None)
+        self._uuids.pop(self._key(v), None)
         with self._lock:
             self._created.pop(v["name"], None)
         self._invalidate()
@@ -489,9 +532,10 @@ class ProxmoxDriver(AbstractSystemsDriver):
         if boot_image is None and self._vm(identity)["vmid"] is None:
             return                          # eject on a VM that isn't there
         v = self._ensure(identity)
-        storage = self._api.nodes(v["node"]).storage(self._iso_storage)
+        iso_storage = self._iso_storage_of(v)
+        storage = self._api_of(v).nodes(v["node"]).storage(iso_storage)
         iso = self._iso_name(v)
-        volid = f"{self._iso_storage}:iso/{iso}"
+        volid = f"{iso_storage}:iso/{iso}"
         qemu = self._qemu(v)
 
         # Always detach first - Proxmox refuses to delete an ISO in use.

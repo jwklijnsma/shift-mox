@@ -17,12 +17,15 @@ LXC: `pct enter 5099`).
 | `./ocp.sh setup` | only install tools and prepare secrets |
 | `./ocp.sh addons` | [Proxmox CSI driver](../install/csi.md) on a running cluster |
 | `./ocp.sh token` | (re)create the Proxmox API user + token |
+| `./ocp.sh token --print` | same, only print the secret (for [another Proxmox cluster](../configuration/multi-proxmox.md)) |
+| `./ocp.sh env list` / `env new <name>` | [environments](../configuration/environments.md) |
 
 ## Options
 
 | Option | Effect |
 |---|---|
-| `--no-tmux` | run in the foreground instead of the tmux session `ocp` |
+| `-E <name>`, `--env <name>` | work on [environment](../configuration/environments.md) `environments/<name>/` (or set `SHIFTMOX_ENV`) |
+| `--no-tmux` | run in the foreground instead of the tmux session `ocp` (`ocp-<env>`) |
 | `--public-api` | use `proxmox_api_host` from `cluster.yml` instead of `127.0.0.1` |
 | `--no-pull` | don't `git pull` first |
 

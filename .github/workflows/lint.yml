@@ -38,6 +38,10 @@ jobs:
       - name: Python (Redfish emulator)
         run: |
           pip install -q ruff
-          ruff check roles/proxmox_redfish/files/
+          ruff check roles/proxmox_redfish/files/ tests/
+      - name: Redfish driver unit tests (fake Proxmox APIs)
+        run: |
+          pip install -q "sushy-tools==2.2.0" pytest
+          pytest -q tests/
       - name: shellcheck
         run: shellcheck ocp.sh

@@ -1,32 +1,85 @@
 ---
-preflight_api: "https://{{ proxmox_api_host }}:{{ proxmox_api_port }}/api2/json"
-preflight_headers:
-  Authorization: "PVEAPIToken={{ proxmox_api_user }}!{{ proxmox_api_token_id }}={{ proxmox_api_token_secret }}"
+# Per Proxmox cluster: API base URL and auth header
+preflight_api: >-
+  {%- set ns = namespace(out={}) -%}
+  {%- for name, c in pve_clusters.items() -%}
+    {%- set ns.out = ns.out | combine({name: 'https://' ~ c.api_host ~ ':' ~ c.api_port ~ '/api2/json'}) -%}
+  {%- endfor -%}
+  {{ ns.out }}
+preflight_headers: >-
+  {%- set ns = namespace(out={}) -%}
+  {%- for name, c in pve_clusters.items() -%}
+    {%- set ns.out = ns.out | combine({name: {'Authorization': 'PVEAPIToken=' ~ c.api_user ~ '!' ~ c.api_token_id ~ '=' ~ c.api_token_secret}}) -%}
+  {%- endfor -%}
+  {{ ns.out }}
 
-# From /cluster/resources
-preflight_data: "{{ preflight_res.json.data | default([]) }}"
+# /cluster/resources of every cluster, each entry tagged with its cluster
+preflight_data: >-
+  {%- set ns = namespace(out=[]) -%}
+  {%- for r in preflight_res.results | default([]) -%}
+    {%- for d in r.json.data | default([]) -%}
+      {%- set ns.out = ns.out + [d | combine({'cluster': r.item})] -%}
+    {%- endfor -%}
+  {%- endfor -%}
+  {{ ns.out }}
 preflight_vms: "{{ preflight_data | selectattr('type', 'in', ['qemu', 'lxc']) | list }}"
 preflight_storage: "{{ preflight_data | selectattr('type', 'equalto', 'storage') | list }}"
 preflight_nodes: "{{ preflight_data | selectattr('type', 'equalto', 'node') | list }}"
 preflight_vnet_names: >-
-  {{ (preflight_vnets.json.data | default([]) | map(attribute='vnet') | list)
-     if (preflight_vnets.status | default(0)) == 200 else [] }}
+  {%- set ns = namespace(out={}) -%}
+  {%- for r in preflight_vnets.results | default([]) if (r.status | default(0)) == 200 -%}
+    {%- set ns.out = ns.out | combine({r.item: r.json.data | default([]) | map(attribute='vnet') | list}) -%}
+  {%- endfor -%}
+  {{ ns.out }}
 
-# Every VM this deploy creates (name, VMID, node, size)
+# Every VM this deploy creates (name, VMID, cluster/node, size, storage, bridge)
 preflight_planned: >-
   {%- set ns = namespace(out=[]) -%}
   {%- for n in ocp_nodes -%}
-    {%- set ns.out = ns.out + [{'vm_name': n.name ~ '.' ~ cluster_name, 'vmid': n.vmid | int, 'pve_node': n.pve_node,
+    {%- set ns.out = ns.out + [{'vm_name': n.name ~ '.' ~ cluster_name, 'vmid': n.vmid | int,
+                                 'pve_cluster': n.pve_cluster, 'pve_node': n.pve_node,
+                                 'place': n.pve_cluster ~ '/' ~ n.pve_node,
+                                 'key': n.pve_cluster ~ '/' ~ n.vmid ~ '/' ~ n.name ~ '.' ~ cluster_name,
+                                 'storage': n.storage, 'bridge': n.bridge, 'vlan': n.vlan | string,
                                  'cores': n.cores, 'memory': n.memory, 'disk_gb': n.disk_gb}] -%}
   {%- endfor -%}
   {%- if ocp_install_method == 'ipi' -%}
     {%- set ns.out = ns.out + [{'vm_name': ipi_provisioner_name ~ '.' ~ cluster_name, 'vmid': ipi_provisioner_vmid | int,
-                                 'pve_node': ipi_provisioner_pve_node,
+                                 'pve_cluster': proxmox_main_cluster, 'pve_node': ipi_provisioner_pve_node,
+                                 'place': proxmox_main_cluster ~ '/' ~ ipi_provisioner_pve_node,
+                                 'key': proxmox_main_cluster ~ '/' ~ ipi_provisioner_vmid ~ '/' ~ ipi_provisioner_name ~ '.' ~ cluster_name,
+                                 'storage': proxmox_disk_storage, 'bridge': proxmox_bridge, 'vlan': proxmox_vlan | string,
                                  'cores': ipi_provisioner_size.cores, 'memory': ipi_provisioner_size.memory,
                                  'disk_gb': ipi_provisioner_size.disk_gb}] -%}
   {%- endif -%}
   {{ ns.out }}
-preflight_vm_nodes: "{{ preflight_planned | map(attribute='pve_node') | unique | list }}"
+preflight_clusters: "{{ preflight_planned | map(attribute='pve_cluster') | unique | list }}"
+# Unique cluster/node pairs, with the bridges VMs there need
+preflight_places: >-
+  {%- set ns = namespace(out=[]) -%}
+  {%- for key in preflight_planned | map(attribute='place') | unique -%}
+    {%- set vms = preflight_planned | selectattr('place', 'equalto', key) | list -%}
+    {%- set ns.out = ns.out + [{'key': key, 'cluster': vms[0].pve_cluster, 'node': vms[0].pve_node,
+                                 'bridges': vms | map(attribute='bridge') | unique | list}] -%}
+  {%- endfor -%}
+  {{ ns.out }}
+# Every (cluster, node, storage, content) that has to exist
+preflight_storage_needs: >-
+  {%- set ns = namespace(out=[]) -%}
+  {%- for p in preflight_planned -%}
+    {%- set ns.out = ns.out + [{'cluster': p.pve_cluster, 'node': p.pve_node, 'storage': p.storage,
+                                 'content': 'images', 'what': 'Disk'}] -%}
+    {%- if proxmox_csi_enabled | bool -%}
+      {%- set ns.out = ns.out + [{'cluster': p.pve_cluster, 'node': p.pve_node, 'storage': proxmox_csi_storage,
+                                   'content': 'images', 'what': 'CSI'}] -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if ocp_install_method != 'ipi' -%}
+    {%- for cl, t in pve_iso_targets.items() if cl in preflight_clusters -%}
+      {%- set ns.out = ns.out + [{'cluster': cl, 'node': t.node, 'storage': t.storage, 'content': 'iso', 'what': 'ISO'}] -%}
+    {%- endfor -%}
+  {%- endif -%}
+  {{ ns.out | unique | list }}
 
 # Every address the cluster uses, with what it is for
 preflight_all_ips: >-

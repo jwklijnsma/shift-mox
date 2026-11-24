@@ -1,0 +1,10 @@
+# Managed by Ansible (roles/proxmox_redfish) - shared by every Shiftmox
+# environment on this host. DHCP only for MACs listed in 50-*.conf (static
+# leases for autoscale slots / ipi nodes); every other MAC is ignored, so it
+# never competes with the network's own DHCP server.
+port=0
+bind-interfaces
+except-interface=lo
+dhcp-ignore=tag:!known
+dhcp-leasefile=/run/proxmox-redfish-dhcp/leases
+log-dhcp

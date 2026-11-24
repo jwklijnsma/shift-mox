@@ -32,12 +32,7 @@
       config:
         features:
           provider: default
-        clusters:
-          - url: "{{ proxmox_k8s_api_url }}"
-            insecure: "{{ proxmox_k8s_insecure | bool }}"
-            token_id: "{{ proxmox_k8s_token_id }}"
-            token_secret: "{{ proxmox_k8s_token_secret }}"
-            region: "{{ proxmox_region }}"
+        clusters: "{{ proxmox_k8s_clusters }}"
   no_log: true
 
 - name: Render the CCM chart {{ proxmox_ccm_chart_version }}

@@ -15,8 +15,13 @@
 #                              autoscaler + machine controller logs, Redfish BMC)
 #   ./ocp.sh setup             only install tools and prepare secrets
 #   ./ocp.sh token             (re)create the Proxmox API user + token (on the node)
+#   ./ocp.sh token --print     same, but only print the secret (for another Proxmox cluster)
+#   ./ocp.sh env list          environments in environments/
+#   ./ocp.sh env new <name>    create environments/<name>/ (own cluster.yml, vault, secrets)
 #
 # Options:
+#   -E, --env <name> work on environments/<name>/ instead of group_vars/all/cluster.yml
+#                    (or set SHIFTMOX_ENV); each environment is its own cluster
 #   --no-tmux        run in the foreground instead of a tmux session
 #   --public-api     use proxmox_api_host from cluster.yml even on the PVE host
 #   --no-pull        don't git pull the latest code first
@@ -28,6 +33,7 @@
 #   ANSIBLE_VAULT_PASSWORD_FILE  file holding the vault password
 #   REPO_URL                  repo to clone when run outside a checkout
 #   REPO_DIR                  where to clone it (default /root/shiftmox)
+#   SHIFTMOX_ENV              environment to use (same as -E)
 # =============================================================================
 set -Eeuo pipefail
 
@@ -44,7 +50,7 @@ warn() { printf '%s !  %s %s\n' "$c_warn" "$c_off" "$*" >&2; }
 die()  { printf '%s ✗ %s %s\n' "$c_err" "$c_off" "$*" >&2; exit 1; }
 trap 'die "failed at line $LINENO: $BASH_COMMAND"' ERR
 
-usage() { sed -n '3,25p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '3,36p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 is_pve_host() { command -v pveversion >/dev/null 2>&1; }
 
@@ -169,25 +175,74 @@ setup_tools() {
 }
 
 # --- 3. secrets ------------------------------------------------------------------
+# Set by set_env (-E / SHIFTMOX_ENV); defaults = the single-cluster layout.
+ENV_NAME="" ENV_DIR="" STATE_DIR=".work" SECRETS_DIR="secrets" REDFISH_SVC="proxmox-redfish"
 vault_file=group_vars/all/vault.yml
+
+set_env() {
+  ENV_NAME="$1"
+  [[ -z "$ENV_NAME" ]] && return 0
+  [[ "$ENV_NAME" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || die "environment name '$ENV_NAME': use a-z, 0-9 and -"
+  ENV_DIR="environments/$ENV_NAME"
+  STATE_DIR=".work/env/$ENV_NAME"
+  SECRETS_DIR="$ENV_DIR/secrets"
+  REDFISH_SVC="proxmox-redfish-$ENV_NAME"
+  TMUX_SESSION="ocp-$ENV_NAME"
+  vault_file="$ENV_DIR/vault.yml"
+}
+
+# Ansible arguments that load the environment (its values override group_vars)
+env_args() {
+  [[ -n "$ENV_NAME" ]] || return 0
+  printf -- '%s\n' -e "shiftmox_env=$ENV_NAME" -e "@$ENV_DIR/cluster.yml"
+  [[ -f "$vault_file" ]] && printf -- '%s\n' -e "@$vault_file"
+  return 0
+}
+
+cmd_env() {
+  local sub="${1:-list}" name="${2:-}"
+  case "$sub" in
+    list)
+      local d found=0
+      for d in environments/*/; do
+        [[ -f "$d/cluster.yml" ]] || continue
+        found=1
+        printf '%-20s cluster %s\n' "$(basename "$d")" \
+          "$(sed -nE 's/^cluster_name:[[:space:]]*"?([^"#]+)"?.*/\1/p' "$d/cluster.yml" | xargs)"
+      done
+      ((found)) || info "no environments yet - create one: ./ocp.sh env new <name>"
+      ;;
+    new)
+      [[ -n "$name" ]] || die "usage: ./ocp.sh env new <name>"
+      set_env "$name"
+      [[ -e "$ENV_DIR" ]] && die "$ENV_DIR already exists"
+      mkdir -p "$SECRETS_DIR" && chmod 700 "$SECRETS_DIR"
+      sed "s/@ENV@/$name/g" environments/example/cluster.yml > "$ENV_DIR/cluster.yml"
+      ok "created $ENV_DIR/cluster.yml - edit it, then: ./ocp.sh -E $name deploy"
+      info "only put what differs from group_vars/all/*.yml in it; secrets go to $ENV_DIR/vault.yml and $SECRETS_DIR/"
+      ;;
+    *) die "usage: ./ocp.sh env list | env new <name>" ;;
+  esac
+}
 
 setup_secrets() {
   # Pull secret (OpenShift only - OKD needs none)
-  mkdir -p secrets && chmod 700 secrets
+  local ps_file="$SECRETS_DIR/pull-secret.json"
+  mkdir -p "$SECRETS_DIR" && chmod 700 "$SECRETS_DIR"
   if [[ "$(cluster_var ocp_distribution)" == okd ]]; then
     ok "pull secret not needed (OKD)"
-  elif [[ ! -s secrets/pull-secret.json ]]; then
+  elif [[ ! -s "$ps_file" ]]; then
     if [[ -n "${OCP_PULL_SECRET_FILE:-}" ]]; then
-      install -m 600 "$OCP_PULL_SECRET_FILE" secrets/pull-secret.json
+      install -m 600 "$OCP_PULL_SECRET_FILE" "$ps_file"
     else
       info "Paste your pull secret (https://console.redhat.com/openshift/install/pull-secret), then Enter:"
       local ps; IFS= read -r ps
-      (umask 077; printf '%s' "$ps" > secrets/pull-secret.json)
+      (umask 077; printf '%s' "$ps" > "$ps_file")
     fi
   fi
-  if [[ -s secrets/pull-secret.json ]]; then
-    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert "auths" in d' secrets/pull-secret.json \
-      2>/dev/null || { rm -f secrets/pull-secret.json; die "pull secret is not valid JSON with an 'auths' key"; }
+  if [[ -s "$ps_file" ]]; then
+    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert "auths" in d' "$ps_file" \
+      2>/dev/null || { rm -f "$ps_file"; die "pull secret is not valid JSON with an 'auths' key"; }
     ok "pull secret"
   fi
 
@@ -246,6 +301,12 @@ cmd_token() {
             | python3 -c 'import json,sys; print(json.load(sys.stdin)["value"])')"
   [[ "$secret" =~ ^[0-9a-f-]{36}$ ]] || die "pveum did not return a token secret"
   ok "token $user!$tid created (privilege separation off)"
+  if [[ "$TOKEN_PRINT" == 1 ]]; then
+    # For an extra Proxmox cluster (proxmox_clusters): copy the secret into the
+    # vault of the environment that uses it, e.g. vault_<cluster>_token_secret.
+    printf '\n  api_token_secret for this Proxmox cluster:  %s\n\n' "$secret"
+    return 0
+  fi
   [[ -f "$vault_file" ]] && cp -p "$vault_file" "$vault_file.bak"
   write_vault "$secret"
   ok "secret stored in $vault_file"
@@ -255,7 +316,7 @@ cmd_token() {
 # Worker autoscaling. On the Proxmox node everything runs here: the Redfish BMC
 # emulator becomes a service on this host (listening only on its IP on the
 # cluster bridge), kubemox in the cluster reaches the API on that same IP, and
-# both use their own token "autoscale" (created here, kept in secrets/).
+# both use their own token "autoscale" (created here, kept in the secrets dir).
 bridge_ip() {  # IPv4 of this host on the cluster bridge (or its VLAN interface)
   local br vlan dev ip
   br="$(cluster_var proxmox_bridge)"; vlan="$(cluster_var proxmox_vlan)"
@@ -264,10 +325,6 @@ bridge_ip() {  # IPv4 of this host on the cluster bridge (or its VLAN interface)
     [[ -n "$ip" ]] && { echo "$ip"; return 0; }
   done
   return 1
-}
-
-install_var() {  # read a plain value from group_vars/all/install.yml
-  sed -nE "s/^$1:[[:space:]]*\"?([^\"#]+)\"?.*/\1/p" group_vars/all/install.yml | head -1 | xargs
 }
 
 # On the Proxmox node, the Redfish BMC (ipi), the load balancer (external) and
@@ -279,7 +336,7 @@ host_role_args() {
   local method csi ip
   HARGS=()
   method="$(cluster_var install_method)"; method="${method:-agent}"
-  csi="$(install_var proxmox_csi_enabled)"
+  csi="$(cluster_var proxmox_csi_enabled)"
   is_pve_host || return 0
   [[ "$method" == agent && "$csi" != true ]] && return 0
   ip="$(bridge_ip)" || die "this host has no IPv4 address on bridge $(cluster_var proxmox_bridge).
@@ -291,8 +348,8 @@ host_role_args() {
          -e "autoscale_proxmox_api_host=$ip" -e autoscale_proxmox_validate_certs=false)
 }
 
-autoscale_token() {  # dedicated token for kubemox + emulator -> secrets/autoscale.json
-  local f=secrets/autoscale.json user secret
+autoscale_token() {  # dedicated token for kubemox + emulator -> <secrets>/autoscale.json
+  local f="$SECRETS_DIR/autoscale.json" user secret
   [[ -s "$f" ]] && return 0
   [[ $EUID -eq 0 ]] || die "run as root (creates a Proxmox API token)"
   user="$(cluster_var proxmox_api_user)"
@@ -302,7 +359,7 @@ autoscale_token() {  # dedicated token for kubemox + emulator -> secrets/autosca
   secret="$(pveum user token add "$user" autoscale --privsep 0 --comment "ocp.sh autoscale (kubemox + Redfish BMC)" \
             --output-format json | python3 -c 'import json,sys; print(json.load(sys.stdin)["value"])')"
   [[ "$secret" =~ ^[0-9a-f-]{36}$ ]] || die "pveum did not return a token secret"
-  mkdir -p secrets && chmod 700 secrets
+  mkdir -p "$SECRETS_DIR" && chmod 700 "$SECRETS_DIR"
   (umask 077; printf '{"autoscale_proxmox_token_id": "autoscale", "autoscale_proxmox_token_secret": "%s"}\n' "$secret" > "$f")
   ok "token $user!autoscale created for autoscaling (revoke: pveum user token remove $user autoscale)"
 }
@@ -321,7 +378,7 @@ cmd_autoscale() {
   if command -v pve-firewall >/dev/null && pve-firewall status 2>/dev/null | grep -q 'enabled/running'; then
     warn "Proxmox firewall is on: allow TCP 8006 and 8443 from $(cluster_var machine_network) to this host"
   fi
-  playbook autoscale.yml -e @secrets/autoscale.json \
+  playbook autoscale.yml -e "@$SECRETS_DIR/autoscale.json" \
     -e redfish_bmc_hosts=localhost -e redfish_bmc_address="$ip" \
     -e autoscale_proxmox_api_host="$ip" -e autoscale_proxmox_validate_certs=false
 }
@@ -337,21 +394,27 @@ vault_args() {
 }
 
 # --- 4. run --------------------------------------------------------------------
-cluster_var() {  # read a plain value from cluster.yml
-  sed -nE "s/^$1:[[:space:]]*\"?([^\"#]+)\"?.*/\1/p" group_vars/all/cluster.yml | head -1 | xargs
+cluster_var() {  # read a plain value: the environment's cluster.yml first, then group_vars
+  local f v
+  for f in ${ENV_DIR:+"$ENV_DIR/cluster.yml"} group_vars/all/cluster.yml group_vars/all/install.yml; do
+    v="$(sed -nE "s/^$1:[[:space:]]*\"?([^\"#]+)\"?.*/\1/p" "$f" 2>/dev/null | head -1 | xargs)"
+    [[ -n "$v" ]] && { echo "$v"; return 0; }
+  done
 }
 
 playbook() {
-  local args=()
+  local args=() eargs=()
   mapfile -t args < <(vault_args)
+  mapfile -t eargs < <(env_args)
+  args+=("${eargs[@]}")
   # On the PVE host: talk to the API over loopback, traffic never leaves the box.
   # The cert is issued for the public name, so validation is off for 127.0.0.1 only.
   if is_pve_host && [[ "$PUBLIC_API" != 1 ]]; then
     args+=(-e proxmox_api_host=127.0.0.1 -e proxmox_validate_certs=false)
   fi
-  mkdir -p .work
+  mkdir -p "$STATE_DIR"
   local log
-  log=".work/${1%.yml}-$(date +%Y%m%d-%H%M%S).log"
+  log="$STATE_DIR/${1%.yml}-$(date +%Y%m%d-%H%M%S).log"
   info "ansible-playbook $* (log: $REPO_DIR/$log)"
   local rc=0
   ANSIBLE_FORCE_COLOR=1 ansible-playbook "$@" "${args[@]}" 2>&1 | tee "$log" || rc=$?
@@ -386,13 +449,13 @@ read -r -p "Press Enter to close this window. " _'
 cmd_status() {
   local name domain kc
   name="$(cluster_var cluster_name)"; domain="$(cluster_var base_domain)"
-  kc=".work/$name/kubeconfig"
+  kc="$STATE_DIR/$name/kubeconfig"
   [[ -f "$kc" ]] || die "no kubeconfig at $REPO_DIR/$kc - has the cluster been deployed?"
   export KUBECONFIG="$REPO_DIR/$kc"
-  local oc=".work/bin/current/oc"
+  local oc="$STATE_DIR/bin/current/oc"
   # clusters deployed before bin/current existed: take the newest release dir
-  [[ -x "$oc" ]] || oc="$(printf '%s\n' .work/bin/*/oc | sort -V | tail -n1)"
-  [[ -x "$oc" ]] || die "no oc binary under $REPO_DIR/.work/bin - run ./ocp.sh setup first"
+  [[ -x "$oc" ]] || oc="$(printf '%s\n' "$STATE_DIR"/bin/*/oc | sort -V | tail -n1)"
+  [[ -x "$oc" ]] || die "no oc binary under $REPO_DIR/$STATE_DIR/bin - run ./ocp.sh setup first"
   "$oc" get nodes -o wide || true
   "$oc" get clusterversion || true
   "$oc" get co --no-headers 2>/dev/null | awk '$3!="True"||$4!="False"||$5!="False"{bad++} END{print (bad? bad" cluster operators not healthy" : "all cluster operators healthy")}' || true
@@ -400,19 +463,19 @@ cmd_status() {
   echo "Console:    https://console-openshift-console.apps.$name.$domain"
   echo "KUBECONFIG: export KUBECONFIG=$REPO_DIR/$kc"
   echo "oc:         $REPO_DIR/$oc"
-  echo "kubeadmin:  $(cat ".work/$name/kubeadmin-password" 2>/dev/null || echo '?')"
+  echo "kubeadmin:  $(cat "$STATE_DIR/$name/kubeadmin-password" 2>/dev/null || echo '?')"
 }
 
 cmd_autoscale_debug() {
   local name kc oc ns=openshift-machine-api out
   name="$(cluster_var cluster_name)"
-  kc=".work/$name/kubeconfig"
+  kc="$STATE_DIR/$name/kubeconfig"
   [[ -f "$kc" ]] || die "no kubeconfig at $REPO_DIR/$kc - has the cluster been deployed?"
   export KUBECONFIG="$REPO_DIR/$kc"
-  oc=".work/bin/current/oc"
-  [[ -x "$oc" ]] || oc="$(printf '%s\n' .work/bin/*/oc | sort -V | tail -n1)"
-  [[ -x "$oc" ]] || die "no oc binary under $REPO_DIR/.work/bin"
-  out=".work/autoscale-debug-$(date +%Y%m%d-%H%M%S).txt"
+  oc="$STATE_DIR/bin/current/oc"
+  [[ -x "$oc" ]] || oc="$(printf '%s\n' "$STATE_DIR"/bin/*/oc | sort -V | tail -n1)"
+  [[ -x "$oc" ]] || die "no oc binary under $REPO_DIR/$STATE_DIR/bin"
+  out="$STATE_DIR/autoscale-debug-$(date +%Y%m%d-%H%M%S).txt"
   sec() { printf '\n===== %s =====\n' "$1"; }
   # A report: empty greps and failing commands are normal, never abort.
   (
@@ -441,8 +504,8 @@ cmd_autoscale_debug() {
     "$oc" -n "$ns" get cronjob autoscale-bmh-repair 2>&1
     j="$("$oc" -n "$ns" get jobs -o name 2>/dev/null | grep autoscale-bmh-repair | tail -n1)"
     [[ -n "$j" ]] && "$oc" -n "$ns" logs "$j" 2>&1 | tail -15
-    sec "Redfish BMC (proxmox-redfish), not the routine GETs"
-    journalctl -u proxmox-redfish --since "6 hours ago" --no-pager 2>&1 | grep -v '"GET /redfish' | tail -50
+    sec "Redfish BMC ($REDFISH_SVC), not the routine GETs"
+    journalctl -u "$REDFISH_SVC" --since "6 hours ago" --no-pager 2>&1 | grep -v '"GET /redfish' | tail -50
     sec "DHCP for the slots (proxmox-redfish-dhcp)"
     systemctl is-active proxmox-redfish-dhcp 2>&1
     journalctl -u proxmox-redfish-dhcp --since "6 hours ago" --no-pager 2>&1 | grep -E 'DHCP(OFFER|ACK|NAK|DISCOVER)|error|fail' | tail -15
@@ -464,12 +527,13 @@ cmd_autoscale_debug() {
     while read -r vmid vname; do
       slot="${vname%%.*}"
       # fixed IP of the slot: from the DHCP static leases (dhcp-host=mac,ip,name,...)
-      ip="$(awk -F'[=,]' -v n="$slot" '$1 == "dhcp-host" && $4 == n {print $3; exit}' /etc/proxmox-redfish/dhcp.conf 2>/dev/null)"
+      ip="$(awk -F'[=,]' -v n="$slot" '$1 == "dhcp-host" && $5 == n {print $4; exit}' \
+            "/etc/proxmox-redfish-dhcp.d/50-sm-${ENV_NAME:-default}.conf" 2>/dev/null)"
       # fallback: the hardware-details annotation (BMO removes it after registration)
       [[ -n "$ip" ]] || ip="$("$oc" -n "$ns" get baremetalhosts.metal3.io "$slot" -o jsonpath='{.metadata.annotations.inspect\.metal3\.io/hardwaredetails}' 2>/dev/null \
             | grep -o '"ip": *"[^"]*"' | head -n1 | cut -d'"' -f4)"
       sec "VM $vmid $vname (IP ${ip:-unknown})"
-      shot=".work/autoscale-debug-console-$slot.png"
+      shot="$STATE_DIR/autoscale-debug-console-$slot.png"
       echo "screendump /tmp/ocp-shot-$vmid.ppm" | qm monitor "$vmid" >/dev/null 2>&1 \
         && python3 - "/tmp/ocp-shot-$vmid.ppm" "$shot" <<'PY' && echo "console screenshot: $REPO_DIR/$shot"
 import sys, zlib, struct
@@ -509,7 +573,7 @@ REMOTE
 
 cmd_destroy() {
   local name; name="$(cluster_var cluster_name)"
-  warn "This deletes all VMs of cluster '$name', the agent ISO and $REPO_DIR/.work/$name."
+  warn "This deletes all VMs of cluster '$name', the agent ISO and $REPO_DIR/$STATE_DIR/$name."
   read -rp "Type the cluster name to confirm: " c
   [[ "$c" == "$name" ]] || die "not confirmed"
   playbook destroy.yml -e "confirm_destroy=$c"
@@ -517,14 +581,18 @@ cmd_destroy() {
 
 # --- main ------------------------------------------------------------------------
 ORIG_ARGS=("$@")
-ACTION="" NO_TMUX=0 PUBLIC_API=0 REBUILD=0 NO_PULL=0
+ACTION="" NO_TMUX=0 PUBLIC_API=0 REBUILD=0 NO_PULL=0 TOKEN_PRINT=0 ENV_OPT="${SHIFTMOX_ENV:-}" ENV_ARGS=()
 while (($#)); do
   case "$1" in
     deploy|wait|status|destroy|setup|token|autoscale|autoscale-debug|addons) ACTION="$1" ;;
+    env)          ACTION="env"; shift; ENV_ARGS=("$@"); break ;;
+    -E|--env)     [[ $# -ge 2 ]] || die "$1 needs an environment name"; ENV_OPT="$2"; shift ;;
+    --env=*)      ENV_OPT="${1#--env=}" ;;
     --rebuild)    REBUILD=1 ;;
     --no-tmux)    NO_TMUX=1 ;;
     --public-api) PUBLIC_API=1 ;;
     --no-pull)    NO_PULL=1 ;;
+    --print)      TOKEN_PRINT=1 ;;
     -h|--help)    usage 0 ;;
     *) warn "unknown argument: $1"; usage 1 ;;
   esac
@@ -535,6 +603,12 @@ done
 main() {
   find_repo
   is_pve_host && info "Running on Proxmox VE host $(hostname) ($(pveversion | cut -d/ -f2))"
+  if [[ "$ACTION" == env ]]; then cmd_env "${ENV_ARGS[@]}"; return; fi
+  set_env "$ENV_OPT"
+  if [[ -n "$ENV_NAME" ]]; then
+    [[ -f "$ENV_DIR/cluster.yml" ]] || die "no environment '$ENV_NAME' ($ENV_DIR/cluster.yml) - create it: ./ocp.sh env new $ENV_NAME"
+    info "environment $ENV_NAME ($ENV_DIR)"
+  fi
   case "$ACTION" in
     setup)   setup_tools; setup_secrets; ok "ready - run: $REPO_DIR/ocp.sh deploy" ;;
     deploy)  setup_tools; setup_secrets; in_tmux || true
