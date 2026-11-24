@@ -67,6 +67,31 @@ when the node list is built.
 
 `-e skip_dns_check=true` skips the DNS checks.
 
+### Does cluster.yml match reality?
+
+Then every value in `cluster.yml` is checked against the real Proxmox cluster
+(role `preflight`). All problems are reported in one go:
+
+| Stops the deploy | |
+|---|---|
+| Storage | `proxmox_disk_storage` exists on every VM node, is active and allows *Disk image*; `proxmox_iso_storage` allows *ISO image*; `proxmox_csi_storage` when CSI is on |
+| Bridge | `proxmox_bridge` exists on every VM node (or is an SDN VNet); `proxmox_vlan` is 1–4094 |
+| VMIDs / names | a planned VMID used by another VM, or a VM with the planned name under another VMID |
+| Sizes | a VM with more cores or RAM than its Proxmox node; all cluster VMs together need more RAM than a node has |
+| Addresses | node IPs, VIPs, gateway (and ipi / autoscale addresses) inside `machine_network`, `prefix_length` matching, no address used twice, no planned address that already answers ping |
+| Secrets | the pull secret exists and has Red Hat registries (OpenShift); `ssh_pubkey_file` is a public key |
+
+| Only a warning | |
+|---|---|
+| RAM / disk | not enough *free* RAM or storage on a node for the new VMs right now (thin storage can overcommit) |
+| Network | the gateway doesn't answer ping; an autoscale slot IP is already in use |
+
+VMs that already exist with the planned name and VMID count as *this*
+cluster (a re-run), so they don't trigger the VMID or ping checks. The ping
+checks only work when the controller is on `machine_network`.
+
+`-e preflight_skip=true` skips these checks; `-e preflight_ping=false` only the pings.
+
 ## Tags of autoscale.yml
 
 | Tag | Does |

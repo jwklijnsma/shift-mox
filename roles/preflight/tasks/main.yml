@@ -1,0 +1,236 @@
+---
+# Does what cluster.yml describes exist? Checks every value against the real
+# Proxmox cluster (and the network) before anything is built, and reports all
+# problems at once instead of failing halfway through a deploy.
+#
+#   errors   (deploy stops):  storage missing / inactive / wrong content type,
+#            bridge missing, VMID or VM name taken by another VM, a VM bigger
+#            than its node, IPs outside machine_network or used twice, an IP
+#            that answers ping although its VM doesn't exist yet, broken pull
+#            secret or SSH key
+#   warnings (deploy goes on): not enough free RAM or disk for the new VMs,
+#            gateway doesn't answer, autoscale slot IPs already in use
+#
+# Skip with -e preflight_skip=true.
+
+- name: Read the Proxmox cluster (nodes, storage, VMs)
+  ansible.builtin.uri:
+    url: "{{ preflight_api }}/cluster/resources"
+    headers: "{{ preflight_headers }}"
+    validate_certs: "{{ proxmox_validate_certs }}"
+    timeout: 20
+  register: preflight_res
+  no_log: true
+
+- name: Bridges on the Proxmox nodes
+  ansible.builtin.uri:
+    url: "{{ preflight_api }}/nodes/{{ item }}/network?type=any_bridge"
+    headers: "{{ preflight_headers }}"
+    validate_certs: "{{ proxmox_validate_certs }}"
+    timeout: 15
+    status_code: [200, 403, 500, 595]
+  register: preflight_net
+  loop: "{{ preflight_vm_nodes }}"
+  no_log: true
+
+- name: SDN VNets (a bridge name can also be a VNet)
+  ansible.builtin.uri:
+    url: "{{ preflight_api }}/cluster/sdn/vnets"
+    headers: "{{ preflight_headers }}"
+    validate_certs: "{{ proxmox_validate_certs }}"
+    timeout: 15
+    status_code: [200, 403, 501]
+  register: preflight_vnets
+  no_log: true
+
+- name: Pull secret and SSH key
+  ansible.builtin.set_fact:
+    preflight_pull_secret_raw: >-
+      {{ lookup('ansible.builtin.file', pull_secret_file, errors='ignore') | default('', true)
+         if not ocp_is_okd else okd_pull_secret }}
+    preflight_ssh_key_raw: "{{ lookup('ansible.builtin.file', ssh_pubkey_file, errors='ignore') | default('', true) }}"
+  no_log: true
+
+# --- Which planned VMs exist already? ----------------------------------------
+- name: Compare planned VMs with what Proxmox has
+  ansible.builtin.set_fact:
+    preflight_new_vms: "{{ preflight_planned | rejectattr('vmid', 'in', preflight_existing_ok) | list }}"
+    preflight_vm_clash: >-
+      {%- set ns = namespace(out=[]) -%}
+      {%- for p in preflight_planned -%}
+        {%- for v in preflight_vms if v.vmid == (p.vmid | int) and v.name | default('') != p.vm_name -%}
+          {%- set ns.out = ns.out + ['VMID ' ~ p.vmid ~ ' (planned for ' ~ p.vm_name ~ ') is already used by "'
+                ~ (v.name | default('?')) ~ '" on ' ~ v.node ~ '. Change vmid_start or move that VM.'] -%}
+        {%- endfor -%}
+        {%- for v in preflight_vms if v.name | default('') == p.vm_name and v.vmid != (p.vmid | int) -%}
+          {%- set ns.out = ns.out + ['A VM named ' ~ p.vm_name ~ ' already exists with VMID ' ~ v.vmid
+                ~ ' (planned: ' ~ p.vmid ~ ') - a leftover of another deploy? Delete it or fix vmid_start.'] -%}
+        {%- endfor -%}
+      {%- endfor -%}
+      {{ ns.out }}
+  vars:
+    preflight_existing_ok: >-
+      {{ preflight_vms | selectattr('name', 'defined')
+         | selectattr('name', 'in', preflight_planned | map(attribute='vm_name') | list)
+         | map(attribute='vmid') | map('int') | list }}
+
+# --- Is an address already taken? ---------------------------------------------
+- name: Ping addresses that should still be free
+  ansible.builtin.command: "ping -c 1 -W 1 {{ item.ip }}"
+  register: preflight_ping_res
+  loop: "{{ preflight_ping_targets }}"
+  loop_control:
+    label: "{{ item.ip }} ({{ item.what }})"
+  changed_when: false
+  failed_when: false
+  when: preflight_ping | bool
+
+- name: Ping the gateway
+  ansible.builtin.command: "ping -c 1 -W 1 {{ gateway }}"
+  register: preflight_ping_gw
+  changed_when: false
+  failed_when: false
+  when: preflight_ping | bool
+
+# --- Collect the findings ------------------------------------------------------
+- name: Collect errors and warnings
+  ansible.builtin.set_fact:
+    preflight_errors: >-
+      {%- set e = namespace(l=[]) -%}
+      {#- storage -#}
+      {%- for n in preflight_vm_nodes -%}
+        {%- set s = preflight_storage | selectattr('node', 'equalto', n) | selectattr('storage', 'equalto', proxmox_disk_storage) | list -%}
+        {%- if s | length == 0 -%}
+          {%- set e.l = e.l + ['Disk storage "' ~ proxmox_disk_storage ~ '" does not exist on ' ~ n ~ ' (proxmox_disk_storage). It has: '
+                ~ (preflight_storage | selectattr('node', 'equalto', n) | map(attribute='storage') | join(', '))] -%}
+        {%- elif s[0].status | default('') != 'available' -%}
+          {%- set e.l = e.l + ['Disk storage "' ~ proxmox_disk_storage ~ '" on ' ~ n ~ ' is ' ~ (s[0].status | default('unknown')) ~ '.'] -%}
+        {%- elif 'images' not in (s[0].content | default('')).split(',') -%}
+          {%- set e.l = e.l + ['Storage "' ~ proxmox_disk_storage ~ '" on ' ~ n
+                ~ ' does not allow content "Disk image" (has: ' ~ s[0].content | default('') ~ ').'] -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {%- if ocp_install_method != 'ipi' -%}
+        {%- set s = preflight_storage | selectattr('node', 'equalto', proxmox_iso_node) | selectattr('storage', 'equalto', proxmox_iso_storage) | list -%}
+        {%- if s | length == 0 -%}
+          {%- set e.l = e.l + ['ISO storage "' ~ proxmox_iso_storage ~ '" does not exist on ' ~ proxmox_iso_node ~ ' (proxmox_iso_storage).'] -%}
+        {%- elif s[0].status | default('') != 'available' -%}
+          {%- set e.l = e.l + ['ISO storage "' ~ proxmox_iso_storage ~ '" on ' ~ proxmox_iso_node ~ ' is ' ~ (s[0].status | default('unknown')) ~ '.'] -%}
+        {%- elif 'iso' not in (s[0].content | default('')).split(',') -%}
+          {%- set e.l = e.l + ['Storage "' ~ proxmox_iso_storage ~ '" does not allow content "ISO image" (has: ' ~ s[0].content | default('') ~ ').'] -%}
+        {%- endif -%}
+      {%- endif -%}
+      {%- if proxmox_csi_enabled | bool -%}
+        {%- for n in preflight_vm_nodes -%}
+          {%- set s = preflight_storage | selectattr('node', 'equalto', n) | selectattr('storage', 'equalto', proxmox_csi_storage) | list -%}
+          {%- if s | length == 0 or 'images' not in (s[0].content | default('')).split(',') -%}
+            {%- set e.l = e.l + ['CSI storage "' ~ proxmox_csi_storage ~ '" is missing on ' ~ n ~ ' or does not allow disk images (proxmox_csi_storage).'] -%}
+          {%- endif -%}
+        {%- endfor -%}
+      {%- endif -%}
+      {#- bridge -#}
+      {%- for r in preflight_net.results -%}
+        {%- set have = (r.json.data | default([])) | map(attribute='iface') | list -%}
+        {%- if r.status == 200 and proxmox_bridge not in have and proxmox_bridge not in preflight_vnet_names -%}
+          {%- set e.l = e.l + ['Bridge "' ~ proxmox_bridge ~ '" does not exist on ' ~ r.item ~ ' (proxmox_bridge). It has: ' ~ (have | join(', '))] -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {%- set vlan = proxmox_vlan | string -%}
+      {%- if vlan | length > 0 and not (vlan is match('^[0-9]+$') and (vlan | int) >= 1 and (vlan | int) <= 4094) -%}
+        {%- set e.l = e.l + ['proxmox_vlan "' ~ proxmox_vlan ~ '" is not a VLAN ID (1-4094).'] -%}
+      {%- endif -%}
+      {#- VMs -#}
+      {%- set e.l = e.l + preflight_vm_clash -%}
+      {%- for p in preflight_planned -%}
+        {%- set node = preflight_nodes | selectattr('node', 'equalto', p.pve_node) | first | default({}) -%}
+        {%- if node.maxcpu is defined and (p.cores | int) > (node.maxcpu | int) -%}
+          {%- set e.l = e.l + [p.vm_name ~ ' wants ' ~ p.cores ~ ' cores, ' ~ p.pve_node ~ ' has ' ~ node.maxcpu ~ ' (master_size / worker_size).'] -%}
+        {%- endif -%}
+        {%- if node.maxmem is defined and (p.memory | int) * 1048576 > (node.maxmem | int) -%}
+          {%- set e.l = e.l + [p.vm_name ~ ' wants ' ~ ((p.memory | int) // 1024) ~ ' GiB RAM, ' ~ p.pve_node
+                ~ ' has ' ~ ((node.maxmem | int) // 1073741824) ~ ' GiB in total.'] -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {%- for n in preflight_vm_nodes -%}
+        {%- set node = preflight_nodes | selectattr('node', 'equalto', n) | first | default({}) -%}
+        {%- set total = preflight_planned | selectattr('pve_node', 'equalto', n) | map(attribute='memory') | map('int') | sum -%}
+        {%- if node.maxmem is defined and total * 1048576 > (node.maxmem | int) -%}
+          {%- set e.l = e.l + ['The cluster VMs on ' ~ n ~ ' need ' ~ (total // 1024) ~ ' GiB RAM together, the node has '
+                ~ ((node.maxmem | int) // 1073741824) ~ ' GiB. Spread them over more proxmox_nodes or make them smaller.'] -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {#- network -#}
+      {%- if (machine_network.split('/') | last | int) != (prefix_length | int) -%}
+        {%- set e.l = e.l + ['prefix_length (' ~ prefix_length ~ ') does not match machine_network ' ~ machine_network ~ '.'] -%}
+      {%- endif -%}
+      {%- if preflight_outside | length > 0 -%}
+        {%- set e.l = e.l + ['Not inside machine_network ' ~ machine_network ~ ': ' ~ (preflight_outside | join(', ')) ~ '.'] -%}
+      {%- endif -%}
+      {%- set d = namespace(l=[]) -%}
+      {%- for ip in preflight_all_ips | map(attribute='ip') | list -%}
+        {%- if (preflight_all_ips | selectattr('ip', 'equalto', ip) | list | length) > 1 and ip not in d.l -%}
+          {%- set d.l = d.l + [ip] -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {%- for ip in d.l -%}
+        {%- set e.l = e.l + [ip ~ ' is used twice: ' ~ (preflight_all_ips | selectattr('ip', 'equalto', ip) | map(attribute='what') | join(' and ')) ~ '.'] -%}
+      {%- endfor -%}
+      {%- for r in (preflight_ping_res.results | default([])) if r.rc | default(1) == 0 and not r.item.soft -%}
+        {%- set e.l = e.l + [r.item.ip ~ ' (' ~ r.item.what ~ ') answers ping, but that VM does not exist yet: the address is taken by something else.'] -%}
+      {%- endfor -%}
+      {#- secrets -#}
+      {%- if not ocp_is_okd -%}
+        {%- if preflight_pull_secret_raw | length == 0 -%}
+          {%- set e.l = e.l + ['Pull secret ' ~ pull_secret_file ~ ' not found (console.redhat.com/openshift/install/pull-secret).'] -%}
+        {%- elif not (preflight_pull_secret_raw is search('"auths"') and preflight_pull_secret_raw is search('cloud\.openshift\.com|registry\.redhat\.io')) -%}
+          {%- set e.l = e.l + ['Pull secret ' ~ pull_secret_file ~ ' does not look like a Red Hat pull secret'
+                ~ ' (no "auths" for cloud.openshift.com / registry.redhat.io).'] -%}
+        {%- endif -%}
+      {%- endif -%}
+      {%- if not (preflight_ssh_key_raw is match('^(ssh-(ed25519|rsa)|ecdsa-sha2-nistp[0-9]+|sk-[a-z0-9@.-]+) [A-Za-z0-9+/=]+')) -%}
+        {%- set e.l = e.l + ['ssh_pubkey_file ' ~ ssh_pubkey_file ~ ' is missing or not an SSH public key.'] -%}
+      {%- endif -%}
+      {{ e.l }}
+    preflight_warnings: >-
+      {%- set w = namespace(l=[]) -%}
+      {%- for n in preflight_vm_nodes -%}
+        {%- set node = preflight_nodes | selectattr('node', 'equalto', n) | first | default({}) -%}
+        {%- set new = preflight_new_vms | selectattr('pve_node', 'equalto', n) | list -%}
+        {%- set mem = new | map(attribute='memory') | map('int') | sum -%}
+        {%- set free = (node.maxmem | default(0) | int) - (node.mem | default(0) | int) -%}
+        {%- if node.maxmem is defined and mem * 1048576 > free -%}
+          {%- set w.l = w.l + [n ~ ': the new VMs need ' ~ (mem // 1024) ~ ' GiB RAM, ' ~ (free // 1073741824) ~ ' GiB is free right now.'] -%}
+        {%- endif -%}
+        {%- set disk = new | map(attribute='disk_gb') | map('int') | sum -%}
+        {%- set s = preflight_storage | selectattr('node', 'equalto', n) | selectattr('storage', 'equalto', proxmox_disk_storage) | first | default({}) -%}
+        {%- set sfree = (s.maxdisk | default(0) | int) - (s.disk | default(0) | int) -%}
+        {%- if s.maxdisk is defined and disk * 1073741824 > sfree -%}
+          {%- set w.l = w.l + [n ~ ': the new VM disks are ' ~ disk ~ ' GB, ' ~ proxmox_disk_storage ~ ' has '
+                ~ (sfree // 1073741824) ~ ' GB free (fine only on thin storage that stays mostly empty).'] -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {%- if (preflight_ping | bool) and (preflight_ping_gw.rc | default(0)) == 1 -%}
+        {%- set w.l = w.l + ['Gateway ' ~ gateway ~ ' does not answer ping from this host (normal if this host is not on ' ~ machine_network ~ ').'] -%}
+      {%- endif -%}
+      {%- for r in (preflight_ping_res.results | default([])) if r.rc | default(1) == 0 and r.item.soft -%}
+        {%- set w.l = w.l + [r.item.ip ~ ' (' ~ r.item.what ~ ') answers ping - an autoscale worker would clash with it.'] -%}
+      {%- endfor -%}
+      {%- if (preflight_ping | bool) and (preflight_ping_gw.rc | default(0)) not in [0, 1] -%}
+        {%- set w.l = w.l + ['ping is not usable here, address checks skipped.'] -%}
+      {%- endif -%}
+      {{ w.l }}
+
+- name: Warnings
+  ansible.builtin.debug:
+    msg: "{{ preflight_warnings }}"
+  when: preflight_warnings | length > 0
+
+- name: The values in cluster.yml must match the real Proxmox cluster
+  ansible.builtin.assert:
+    that: preflight_errors | length == 0
+    fail_msg: >-
+      {{ ['cluster.yml does not match reality (' ~ (preflight_errors | length)
+          ~ ' problem(s); skip with -e preflight_skip=true):'] + preflight_errors }}
+    success_msg: >-
+      cluster.yml matches Proxmox: {{ preflight_planned | length }} VM(s) on {{ preflight_vm_nodes | join(', ') }},
+      {{ preflight_new_vms | length }} to create, storage {{ proxmox_disk_storage }} and bridge {{ proxmox_bridge }} present.

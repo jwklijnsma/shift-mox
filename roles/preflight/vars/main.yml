@@ -1,0 +1,80 @@
+---
+preflight_api: "https://{{ proxmox_api_host }}:{{ proxmox_api_port }}/api2/json"
+preflight_headers:
+  Authorization: "PVEAPIToken={{ proxmox_api_user }}!{{ proxmox_api_token_id }}={{ proxmox_api_token_secret }}"
+
+# From /cluster/resources
+preflight_data: "{{ preflight_res.json.data | default([]) }}"
+preflight_vms: "{{ preflight_data | selectattr('type', 'in', ['qemu', 'lxc']) | list }}"
+preflight_storage: "{{ preflight_data | selectattr('type', 'equalto', 'storage') | list }}"
+preflight_nodes: "{{ preflight_data | selectattr('type', 'equalto', 'node') | list }}"
+preflight_vnet_names: >-
+  {{ (preflight_vnets.json.data | default([]) | map(attribute='vnet') | list)
+     if (preflight_vnets.status | default(0)) == 200 else [] }}
+
+# Every VM this deploy creates (name, VMID, node, size)
+preflight_planned: >-
+  {%- set ns = namespace(out=[]) -%}
+  {%- for n in ocp_nodes -%}
+    {%- set ns.out = ns.out + [{'vm_name': n.name ~ '.' ~ cluster_name, 'vmid': n.vmid | int, 'pve_node': n.pve_node,
+                                 'cores': n.cores, 'memory': n.memory, 'disk_gb': n.disk_gb}] -%}
+  {%- endfor -%}
+  {%- if ocp_install_method == 'ipi' -%}
+    {%- set ns.out = ns.out + [{'vm_name': ipi_provisioner_name ~ '.' ~ cluster_name, 'vmid': ipi_provisioner_vmid | int,
+                                 'pve_node': ipi_provisioner_pve_node,
+                                 'cores': ipi_provisioner_size.cores, 'memory': ipi_provisioner_size.memory,
+                                 'disk_gb': ipi_provisioner_size.disk_gb}] -%}
+  {%- endif -%}
+  {{ ns.out }}
+preflight_vm_nodes: "{{ preflight_planned | map(attribute='pve_node') | unique | list }}"
+
+# Every address the cluster uses, with what it is for
+preflight_all_ips: >-
+  {%- set ns = namespace(out=[]) -%}
+  {%- for n in ocp_nodes -%}
+    {%- set ns.out = ns.out + [{'ip': n.ip, 'what': n.name}] -%}
+  {%- endfor -%}
+  {%- if not ocp_is_sno and ocp_install_method != 'external' -%}
+    {%- set ns.out = ns.out + [{'ip': api_vip, 'what': 'api_vip'}, {'ip': ingress_vip, 'what': 'ingress_vip'}] -%}
+  {%- endif -%}
+  {%- if ocp_install_method == 'ipi' -%}
+    {%- set ns.out = ns.out + [{'ip': ipi_provisioner_ip, 'what': 'ipi_provisioner_ip'}, {'ip': ipi_bootstrap_ip, 'what': 'ipi_bootstrap_ip'}] -%}
+  {%- endif -%}
+  {%- for s in (autoscale_pool if autoscale_enabled | bool else []) -%}
+    {%- set ns.out = ns.out + [{'ip': s.ip, 'what': s.name}] -%}
+  {%- endfor -%}
+  {%- set ns.out = ns.out + [{'ip': gateway, 'what': 'gateway'}] -%}
+  {{ ns.out }}
+
+# Addresses outside machine_network (plain integer math, no netaddr needed)
+preflight_outside: >-
+  {%- set net = machine_network.split('/') -%}
+  {%- set o = net[0].split('.') | map('int') | list -%}
+  {%- set start = o[0] * 16777216 + o[1] * 65536 + o[2] * 256 + o[3] -%}
+  {%- set size = 2 ** (32 - (net[1] | int)) -%}
+  {%- set ns = namespace(out=[]) -%}
+  {%- for a in preflight_all_ips -%}
+    {%- set p = a.ip.split('.') | map('int') | list -%}
+    {%- set i = p[0] * 16777216 + p[1] * 65536 + p[2] * 256 + p[3] -%}
+    {%- if i <= start or i >= start + size - 1 -%}
+      {%- set ns.out = ns.out + [a.ip ~ ' (' ~ a.what ~ ')'] -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {{ ns.out }}
+
+# Ping only what should be free: IPs of VMs that don't exist yet, and the VIPs
+# / ipi addresses on a fresh install (when no cluster VM exists). soft = only warn.
+preflight_fresh: "{{ (preflight_new_vms | length) == (preflight_planned | length) }}"
+preflight_ping_targets: >-
+  {%- set new = preflight_new_vms | map(attribute='vm_name') | list -%}
+  {%- set ns = namespace(out=[]) -%}
+  {%- for a in preflight_all_ips if a.what != 'gateway' -%}
+    {%- set is_vm = (a.what ~ '.' ~ cluster_name) in (preflight_planned | map(attribute='vm_name') | list) -%}
+    {%- set is_slot = a.what is match(autoscale_name_prefix ~ '-[0-9]+$') -%}
+    {%- if (is_vm and (a.what ~ '.' ~ cluster_name) in new) or (not is_vm and not is_slot and preflight_fresh) -%}
+      {%- set ns.out = ns.out + [a | combine({'soft': false})] -%}
+    {%- elif is_slot and preflight_fresh -%}
+      {%- set ns.out = ns.out + [a | combine({'soft': true})] -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {{ ns.out }}
