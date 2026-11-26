@@ -69,6 +69,7 @@ Details: [Requirements](https://jwklijnsma.github.io/shift-mox/getting-started/r
 | `./ocp.sh autoscale` | set up worker autoscaling |
 | `./ocp.sh autoscale-debug` | one report of everything autoscaling, incl. inside the worker VMs |
 | `./ocp.sh addons` | Proxmox CSI driver on a running cluster |
+| `./ocp.sh e2e` | end-to-end tests: agent / ipi / external × OVN / Calico — deploy, verify, scale, destroy |
 | `./ocp.sh token` / `setup` | Proxmox API token / only tools and secrets |
 
 Without `ocp.sh`: `ansible-playbook site.yml | destroy.yml | autoscale.yml | addons.yml | runner.yml`

@@ -46,6 +46,7 @@ nav = [
     { "Repository layout" = "reference/layout.md" },
     { "Releases and updates" = "reference/releases.md" },
     { "Design: native platform" = "reference/native-platform.md" },
+    { "End-to-end tests" = "reference/e2e.md" },
   ] },
 ]
 

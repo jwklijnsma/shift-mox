@@ -19,6 +19,7 @@ LXC: `pct enter 5099`).
 | `./ocp.sh token` | (re)create the Proxmox API user + token |
 | `./ocp.sh token --print` | same, only print the secret (for [another Proxmox cluster](../configuration/multi-proxmox.md)) |
 | `./ocp.sh env list` / `env new <name>` | [environments](../configuration/environments.md) |
+| `./ocp.sh e2e [cases]` | [end-to-end tests](../reference/e2e.md): deploy, verify, scale, destroy every install method × CNI |
 
 ## Options
 

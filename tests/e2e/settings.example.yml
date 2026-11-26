@@ -1,0 +1,44 @@
+---
+# End-to-end test settings. Copy to tests/e2e/settings.yml and fill in.
+#
+# Every case (agent/ipi/external x OVN/Calico) gets its own environment
+# environments/e2e-<case>/ built from this file, is deployed, tested, scaled
+# and destroyed again - one after the other, so all cases reuse the same
+# addresses and VMIDs below. They must NOT overlap with any other cluster.
+#
+# DNS (needed before the run; see tests/e2e/README.md):
+#   api / api-int.e2e.<base_domain>       -> api_vip
+#   *.apps.e2e.<base_domain>              -> ingress_vip
+#   api / api-int.e2e-ext.<base_domain>   -> the Proxmox host's bridge IP (HAProxy, external cases)
+#   *.apps.e2e-ext.<base_domain>          -> the Proxmox host's bridge IP
+
+base_domain: lab.example.nl
+ocp_distribution: okd            # ocp needs secrets/pull-secret.json
+# ocp_version: "4.20"            # default: group_vars
+
+machine_network: 192.168.50.0/24
+gateway: 192.168.50.1
+dns_servers: [192.168.50.200]
+api_vip: 192.168.50.110
+ingress_vip: 192.168.50.111
+ip_start: 192.168.50.121         # masters, worker(s), then the autoscale slots
+vmid_start: 5900
+
+# ipi only: provisioner VM and bootstrap VM
+ipi_provisioner_ip: 192.168.50.118
+ipi_bootstrap_ip: 192.168.50.119
+
+proxmox_nodes: [node02]
+
+# Small but supported: 3 masters + 1 worker, 1 extra autoscale slot
+ocp_master_count: 3
+ocp_worker_count: 1
+master_size: { cores: 8, memory: 16384, disk_gb: 120 }
+worker_size: { cores: 4, memory: 16384, disk_gb: 120 }
+autoscale_max_workers: 2
+
+# Own BMC port, so a cluster that already uses 8443 on this host keeps working
+redfish_bmc_port: 8450
+
+# Also test the Proxmox CSI driver (PVC on proxmox_csi_storage)
+proxmox_csi_enabled: false
