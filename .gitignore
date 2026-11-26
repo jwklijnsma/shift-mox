@@ -12,3 +12,5 @@ site/
 environments/*/secrets/
 environments/*/vault.yml
 environments/*/vault.yml.*
+tests/e2e/settings.yml
+environments/e2e-*/

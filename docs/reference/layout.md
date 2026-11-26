@@ -14,6 +14,7 @@ group_vars/all/
   install.yml                         <- ipi / external / CCM / CSI settings
 environments/<name>/                  <- one cluster: cluster.yml, vault.yml, secrets/
 tests/                                <- unit tests of the Redfish driver (pytest)
+tests/e2e/                            <- end-to-end tests (./ocp.sh e2e)
   runner.yml                          <- runner LXC
   vault.yml(.example)                 <- secrets (ansible-vault)
   derived.yml                         computed values (generated nodes, slots, ...)

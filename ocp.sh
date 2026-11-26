@@ -18,6 +18,7 @@
 #   ./ocp.sh token --print     same, but only print the secret (for another Proxmox cluster)
 #   ./ocp.sh env list          environments in environments/
 #   ./ocp.sh env new <name>    create environments/<name>/ (own cluster.yml, vault, secrets)
+#   ./ocp.sh e2e [cases]       end-to-end tests: deploy, verify, scale, destroy (tests/e2e/)
 #
 # Options:
 #   -E, --env <name> work on environments/<name>/ instead of group_vars/all/cluster.yml
@@ -50,7 +51,7 @@ warn() { printf '%s !  %s %s\n' "$c_warn" "$c_off" "$*" >&2; }
 die()  { printf '%s ✗ %s %s\n' "$c_err" "$c_off" "$*" >&2; exit 1; }
 trap 'die "failed at line $LINENO: $BASH_COMMAND"' ERR
 
-usage() { sed -n '3,36p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '3,37p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 is_pve_host() { command -v pveversion >/dev/null 2>&1; }
 
@@ -254,7 +255,12 @@ setup_secrets() {
   fi
   ok "ssh key"
 
-  # Proxmox API token secret
+  # Proxmox API token secret. An environment without its own vault.yml uses
+  # group_vars/all/vault.yml (always loaded) - never replace that token.
+  if [[ ! -f "$vault_file" && -n "$ENV_NAME" && -f group_vars/all/vault.yml ]]; then
+    ok "proxmox token (group_vars/all/vault.yml)"
+    return 0
+  fi
   if [[ ! -f "$vault_file" ]]; then
     if [[ -n "${PROXMOX_API_TOKEN_SECRET:-}" ]]; then
       write_vault "$PROXMOX_API_TOKEN_SECRET"
@@ -349,19 +355,21 @@ host_role_args() {
 }
 
 autoscale_token() {  # dedicated token for kubemox + emulator -> <secrets>/autoscale.json
-  local f="$SECRETS_DIR/autoscale.json" user secret
+  # One token per environment, so a new environment never replaces the token
+  # another cluster's BMC is using.
+  local f="$SECRETS_DIR/autoscale.json" user secret tid="autoscale${ENV_NAME:+-$ENV_NAME}"
   [[ -s "$f" ]] && return 0
   [[ $EUID -eq 0 ]] || die "run as root (creates a Proxmox API token)"
   user="$(cluster_var proxmox_api_user)"
   pveum user list --output-format json | python3 -c 'import json,sys; sys.exit(0 if any(u["userid"]==sys.argv[1] for u in json.load(sys.stdin)) else 1)' "$user" \
     || die "Proxmox user $user does not exist yet - run ./ocp.sh token (or deploy) first"
-  pveum user token remove "$user" autoscale >/dev/null 2>&1 || true
-  secret="$(pveum user token add "$user" autoscale --privsep 0 --comment "ocp.sh autoscale (kubemox + Redfish BMC)" \
+  pveum user token remove "$user" "$tid" >/dev/null 2>&1 || true
+  secret="$(pveum user token add "$user" "$tid" --privsep 0 --comment "ocp.sh autoscale (kubemox + Redfish BMC)${ENV_NAME:+ - $ENV_NAME}" \
             --output-format json | python3 -c 'import json,sys; print(json.load(sys.stdin)["value"])')"
   [[ "$secret" =~ ^[0-9a-f-]{36}$ ]] || die "pveum did not return a token secret"
   mkdir -p "$SECRETS_DIR" && chmod 700 "$SECRETS_DIR"
-  (umask 077; printf '{"autoscale_proxmox_token_id": "autoscale", "autoscale_proxmox_token_secret": "%s"}\n' "$secret" > "$f")
-  ok "token $user!autoscale created for autoscaling (revoke: pveum user token remove $user autoscale)"
+  (umask 077; printf '{"autoscale_proxmox_token_id": "%s", "autoscale_proxmox_token_secret": "%s"}\n' "$tid" "$secret" > "$f")
+  ok "token $user!$tid created for autoscaling (revoke: pveum user token remove $user $tid)"
 }
 
 cmd_autoscale() {
@@ -376,7 +384,7 @@ cmd_autoscale() {
   ok "cluster bridge address of this host: $ip"
   autoscale_token
   if command -v pve-firewall >/dev/null && pve-firewall status 2>/dev/null | grep -q 'enabled/running'; then
-    warn "Proxmox firewall is on: allow TCP 8006 and 8443 from $(cluster_var machine_network) to this host"
+    warn "Proxmox firewall is on: allow TCP 8006 and $(cluster_var redfish_bmc_port) from $(cluster_var machine_network) to this host"
   fi
   playbook autoscale.yml -e "@$SECRETS_DIR/autoscale.json" \
     -e redfish_bmc_hosts=localhost -e redfish_bmc_address="$ip" \
@@ -384,7 +392,12 @@ cmd_autoscale() {
 }
 
 vault_args() {
-  if head -c 14 "$vault_file" 2>/dev/null | grep -qF "\$ANSIBLE_VAULT"; then
+  # group_vars/all/vault.yml is always loaded, so it counts in an environment too
+  local f enc=0
+  for f in "$vault_file" group_vars/all/vault.yml; do
+    head -c 14 "$f" 2>/dev/null | grep -qF "\$ANSIBLE_VAULT" && enc=1
+  done
+  if ((enc)); then
     if [[ -n "${ANSIBLE_VAULT_PASSWORD_FILE:-}" ]]; then
       printf -- '--vault-password-file\n%s\n' "$ANSIBLE_VAULT_PASSWORD_FILE"
     else
@@ -396,7 +409,7 @@ vault_args() {
 # --- 4. run --------------------------------------------------------------------
 cluster_var() {  # read a plain value: the environment's cluster.yml first, then group_vars
   local f v
-  for f in ${ENV_DIR:+"$ENV_DIR/cluster.yml"} group_vars/all/cluster.yml group_vars/all/install.yml; do
+  for f in ${ENV_DIR:+"$ENV_DIR/cluster.yml"} group_vars/all/cluster.yml group_vars/all/install.yml group_vars/all/autoscale.yml; do
     v="$(sed -nE "s/^$1:[[:space:]]*\"?([^\"#]+)\"?.*/\1/p" "$f" 2>/dev/null | head -1 | xargs)"
     [[ -n "$v" ]] && { echo "$v"; return 0; }
   done
@@ -574,7 +587,8 @@ REMOTE
 cmd_destroy() {
   local name; name="$(cluster_var cluster_name)"
   warn "This deletes all VMs of cluster '$name', the agent ISO and $REPO_DIR/$STATE_DIR/$name."
-  read -rp "Type the cluster name to confirm: " c
+  local c="${OCP_CONFIRM_DESTROY:-}"   # unattended (e2e tests): OCP_CONFIRM_DESTROY=<cluster name>
+  [[ -n "$c" ]] || read -rp "Type the cluster name to confirm: " c
   [[ "$c" == "$name" ]] || die "not confirmed"
   playbook destroy.yml -e "confirm_destroy=$c"
 }
@@ -585,6 +599,7 @@ ACTION="" NO_TMUX=0 PUBLIC_API=0 REBUILD=0 NO_PULL=0 TOKEN_PRINT=0 ENV_OPT="${SH
 while (($#)); do
   case "$1" in
     deploy|wait|status|destroy|setup|token|autoscale|autoscale-debug|addons) ACTION="$1" ;;
+    e2e)          ACTION="e2e"; shift; ENV_ARGS=("$@"); break ;;
     env)          ACTION="env"; shift; ENV_ARGS=("$@"); break ;;
     -E|--env)     [[ $# -ge 2 ]] || die "$1 needs an environment name"; ENV_OPT="$2"; shift ;;
     --env=*)      ENV_OPT="${1#--env=}" ;;
@@ -604,6 +619,13 @@ main() {
   find_repo
   is_pve_host && info "Running on Proxmox VE host $(hostname) ($(pveversion | cut -d/ -f2))"
   if [[ "$ACTION" == env ]]; then cmd_env "${ENV_ARGS[@]}"; return; fi
+  if [[ "$ACTION" == e2e ]]; then
+    # end-to-end tests: hours; run in tmux session "ocp-e2e" (tests/e2e/README.md)
+    TMUX_SESSION="ocp-e2e"
+    setup_tools
+    in_tmux || true
+    exec tests/e2e/run.sh "${ENV_ARGS[@]}"
+  fi
   set_env "$ENV_OPT"
   if [[ -n "$ENV_NAME" ]]; then
     [[ -f "$ENV_DIR/cluster.yml" ]] || die "no environment '$ENV_NAME' ($ENV_DIR/cluster.yml) - create it: ./ocp.sh env new $ENV_NAME"
